@@ -1,0 +1,24 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+logs/
+.pytest_cache/
+*.log
+.venv/
+venv/
+
+# 生成的数据和结果
+data/
+backtest_results/
+strike_filter_results/
+timing_results/
+weekend_results/
+charts/
+
+# pip 安装产生的垃圾文件
+=*
