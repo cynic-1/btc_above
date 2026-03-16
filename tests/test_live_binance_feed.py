@@ -78,12 +78,20 @@ class TestUpdateKline:
         assert feed._klines[0].close == 85040.0
         assert feed._current_price == 85040.0
 
-    def test_24h_window_trim(self, feed):
-        """应保持 24h 窗口，移除过旧数据"""
-        # 填充 1445 条 K线（超过 24h = 1440 条）
+    def test_buffer_window_trim(self):
+        """应按 har_train_days 窗口裁剪过旧数据"""
+        # 使用 har_train_days=1（1440分钟）方便测试
+        cfg = LiveTradingConfig(
+            binance_ws_url="wss://test/ws",
+            binance_rest_url="https://test",
+            har_train_days=1,
+        )
+        f = BinanceKlineFeed(cfg)
+
+        # 填充 1445 条 K线（超过 1天 = 1440 条）
         base_time = 0
         for i in range(1445):
-            feed._klines.append(_make_kline(base_time + i * 60000, 85000.0 + i))
+            f._klines.append(_make_kline(base_time + i * 60000, 85000.0 + i))
 
         # 添加新 K线
         new_time = base_time + 1445 * 60000
@@ -97,9 +105,61 @@ class TestUpdateKline:
             "v": "100.0",
             "x": True,
         }
+        f._update_kline(k_data)
+
+        # 1天窗口: 应裁剪到 <= 1441 条
+        assert len(f._klines) <= 1441
+
+
+class TestBufferSizing:
+    """缓冲区大小应匹配 har_train_days 配置"""
+
+    def test_buffer_30_days(self):
+        """默认 har_train_days=30 → 缓冲区 43200 分钟"""
+        config = LiveTradingConfig(
+            binance_ws_url="wss://test/ws",
+            binance_rest_url="https://test",
+            har_train_days=30,
+        )
+        feed = BinanceKlineFeed(config)
+        assert feed._buffer_minutes == 30 * 24 * 60
+
+    def test_buffer_custom_days(self):
+        """自定义 har_train_days=7 → 缓冲区 10080 分钟"""
+        config = LiveTradingConfig(
+            binance_ws_url="wss://test/ws",
+            binance_rest_url="https://test",
+            har_train_days=7,
+        )
+        feed = BinanceKlineFeed(config)
+        assert feed._buffer_minutes == 7 * 24 * 60
+
+    def test_trim_uses_buffer_minutes(self):
+        """WS 更新应按 har_train_days 窗口裁剪"""
+        config = LiveTradingConfig(
+            binance_ws_url="wss://test/ws",
+            binance_rest_url="https://test",
+            har_train_days=1,  # 1天 = 1440 分钟
+        )
+        feed = BinanceKlineFeed(config)
+
+        # 填充 1445 条 K线
+        base_time = 0
+        for i in range(1445):
+            feed._klines.append(_make_kline(base_time + i * 60000, 85000.0 + i))
+
+        # 添加新 K线触发裁剪
+        new_time = base_time + 1445 * 60000
+        k_data = {
+            "t": new_time,
+            "T": new_time + 59999,
+            "o": "86000.0", "h": "86010.0",
+            "l": "85990.0", "c": "86005.0",
+            "v": "100.0", "x": True,
+        }
         feed._update_kline(k_data)
 
-        # 应该裁剪到 ~1440 条
+        # 1天窗口: 应裁剪到 <= 1441 条
         assert len(feed._klines) <= 1441
 
 

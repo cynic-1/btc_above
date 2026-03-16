@@ -246,6 +246,110 @@
   - **已知风险**: VRP 未校准(k=1.0)、回测期仅 22 天、市场冲击未建模、Alpha 可能暂时
   - 详见分析文件: `/home/ubuntu/.claude/plans/wise-growing-kurzweil.md`
 
+- **CLOB 价格缓存过期修复 + Dome API 订单簿历史下载**:
+  - `update_data.py` — 修复已结算事件的 CLOB 价格缓存不刷新 bug（`has_trades` 仅检查文件存在，不检查数据完整性）；新增 `event_date+1d` 阈值，缓存文件修改时间早于此则重新下载
+  - `backtest/dome_orderbook.py` — `DomeOrderbookFetcher` 从 Dome API (`api.domeapi.io`) 分页获取历史订单簿快照，提取 best_bid/best_ask 保存为 npz 缓存（与现有 `OrderbookPriceLookup` 完全兼容）
+  - `update_data.py` — 新增 Step 4 订单簿更新: `--orderbooks-only`, `--force-orderbooks`, `--ob-lookback-hours` 参数；默认下载结算前 24h 订单簿
+  - 覆盖所有 69 个已结算事件日 768 个合约
+
+- **回测-实盘差异修复 (3 units)** — 修复导致回测高估盈利、实盘低估的三个独立问题:
+  1. **Stale orderbook → 跳过交易**: `HybridPriceLookup.get_quote_at()` 过期时返回 `None`（不再构造零价差合成 quote）；`simulate_portfolio()` 无真实 bid/ask 或 bid==ask 时 `continue` 跳过
+  2. **固定 strike 网格**: `BacktestConfig` 新增 `use_fixed_strikes: bool = True`；`BacktestEngine.run()` 从 `_poly_markets` 预计算 `fixed_strikes_by_date`，传入 `_run_single_observation()`；有固定 strikes 时使用，否则回退动态网格
+  3. **HAR 训练缓冲区扩容**: `BinanceKlineFeed.__init__()` 新增 `_buffer_minutes = config.har_train_days * 24 * 60`；`_load_initial_klines()` 和 `_update_kline()` 使用 `_buffer_minutes` 替代硬编码 `_24H_MINUTES`
+  - 404/404 tests passing (5 skipped)
+
+- **订单簿缓存完整性检查** — 自动检测并重新下载不完整的订单簿缓存:
+  - `backtest/dome_orderbook.py` — `DomeOrderbookFetcher.is_cache_complete(cid, settlement_ms, tolerance_ms=1h)`: 检查 npz 最后快照是否覆盖到结算前 1h 以内
+  - `update_data.py` — `update_orderbooks()` 改用 `is_cache_complete()` 替代 `has_cache()`; `date_str >= today` 跳过（严格小于，确保结算已完成再下载）; 日志标注"缺失"/"不完整"原因
+  - `tests/test_dome_orderbook.py` — 8 个测试: 完整/不完整/无文件/空文件/边界/自定义 tolerance/结算后数据
+  - 412/412 tests passing (5 skipped)
+
+- **实盘定价与回测对齐** — 消除实盘 vs 回测的 3 个输入级差异:
+  1. **HAR 训练排除事件日**: `LivePricingEngine.train_har()` 新增 `event_date` 参数，过滤 `open_time < midnight_utc(event_date)` 的 K线参与训练（与 `har_trainer.py` 的 `end_ms = _date_to_utc_ms(end_date) - 1` 一致）
+  2. **定价 K线窗口限制 24h**: `compute_prices()` 内部过滤 `klines` 到最近 24h（`open_time >= now_utc_ms - 24h`），与 `chart_engine.py` 的 `lookback_ms = 24 * 60 * 60 * 1000` 一致
+  3. **engine.py 传递 event_date**: `LiveTradingEngine.start()` 调用 `train_har(klines, event_date)` 而非 `train_har(klines)`
+  - 新增 2 个测试: `test_train_excludes_event_day`（验证事件日数据被排除）、`test_24h_kline_filter`（验证 24h 窗口过滤）
+  - **Off-by-one 修复**: lookback 从 24h 改为 24h+1min（`chart_engine.py` + `pricing_engine.py`），确保 1441 条 K线差分后 returns=1440 ≥ HAR 最大窗口 1440，消除 `returns 长度 1439 < window 1440` 警告
+  - 414/414 tests passing (5 skipped)
+
+- **价格收敛分析 — 中途卖出的胜率与赔率**:
+  - `backtest/convergence.py` — 核心逻辑: `load_price_lookup()` 从 detail.csv 构建 (date,strike,obs_min)→(bid,ask) 查询表; `find_trade_signals()` 逐行判断入场信号（同 simulate_portfolio 的 YES/NO elif 逻辑）; `compute_exit_pnl()` 查找退出时 bid/ask 计算中途卖出 PnL; `compute_settlement_pnl()` 持有到结算对照; `aggregate_holding_period()` 聚合胜率/赔率/PnL; `run_convergence()` 串联全流程
+  - `run_convergence.py` — CLI 入口 (`--detail-csv`, `--output-dir`, `--entry-threshold`, `--shares-per-trade`)，输出 2 张 ASCII 表（总体 + 方向拆分）+ convergence.csv + convergence_summary.txt
+  - `tests/test_convergence.py` — 33 个测试: 价格加载、信号识别、YES/NO PnL 计算、边界条件（无数据/极端价格/bid==ask）、聚合统计、完整 pipeline
+  - 持有期: 30m / 1h / 2h / 3h / 6h / 结算
+  - 关键发现 (threshold=0.03, 73 天 178,401 signals, 全部市场组合):
+    - 组合 6h 退出即正 EV: TotalPnL=+$98,585，接近结算的 +$101,009
+    - NO 方向是 alpha 来源: 3h 起正 EV(+$70,322), 6h +$234,926, 结算 +$365,565
+    - YES 方向全亏: 所有持有期均负，结算 -$264,556
+    - 收敛速度: NO 信号 WinR 从 30m 的 32.9% 升至 6h 的 66.2%，赔率从 1.07 降至 0.70
+    - 结论: NO 信号确有中途收敛价值(3h+即可获利)；YES 信号无论持有多久均亏损；"快进快出"对 NO-only 策略可行
+
+- **一触碰障碍期权定价模型 & 回测系统** — Polymarket "What price will Bitcoin hit?" 月度触碰合约的定价与回测:
+  - **核心定价** (`touch/barrier_pricing.py`):
+    - GBM 下一触碰概率解析公式: `one_touch_up()` (上触碰)、`one_touch_down()` (下触碰)、`one_touch()` (自动判断方向)
+    - `price_touch_barriers()` 批量定价，自动处理已触碰 (running_high/low) → P=1.0
+    - 边界处理: K=S0→1.0, T≤0→0/1, σ=0→确定性, σ√T极小→clamp 防溢出
+  - **数据模型** (`touch/models.py`):
+    - `TouchMarketInfo` — Polymarket 触碰合约信息 (month, barrier, direction, condition_id, token_ids)
+    - `TouchStrikeResult` — 单 barrier 定价结果 (p_touch, already_touched, p_trade, edge)
+    - `TouchObservationResult` — 时间步观测 (s0, running_high/low, T_remaining, sigma, predictions, labels, market_prices)
+    - `TouchBacktestConfig` — 回测配置 (month, step_minutes=60, iv_source, vrp_k, default_sigma, mu, shrinkage, orderbook_cache_dir)
+  - **IV 数据管道** (`touch/iv_source.py`):
+    - `DeribitIVSource` — 实时 ATM IV (期权链) + DVOL 获取
+    - `DeribitIVCache` — DVOL 历史缓存 (gzip CSV)，bisect 查询防前瞻偏差，自动百分比/小数转换
+  - **市场发现** (`touch/market_discovery.py`):
+    - `discover_touch_markets()` — Gamma API 按 slug 查询 + 缓存
+    - 解析 "$90,000 or above" → barrier=90000, direction="up"
+    - `parse_month_from_slug()` — 从 slug 提取月份
+  - **回测引擎** (`touch/backtest_engine.py`):
+    - `TouchBacktestEngine` — 月度循环回测
+    - O(N) 预计算 running_high/running_low (使用 kline.high/low 捕获分钟内极值)
+    - IV 回退链: DVOL 缓存 → VRP 缩放 → 默认 sigma
+    - 复用 `pricing_core/execution.py` (shrinkage, edge)、`backtest/data_cache.py` (K线缓存)
+    - 市场价格来源: 优先使用 Dome 订单簿 (`OrderbookPriceLookup`)，回退到 CLOB 交易数据 (`PolymarketPriceLookup`)
+    - `compute_metrics()` — Brier score + per-barrier 详情
+  - **图表生成** (`touch/chart_engine.py`):
+    - `TouchChartGenerator` — 双轴图表 (概率 + BTC 价格)
+    - 模型 p_touch vs Polymarket 价格 + edge 区域填充
+    - 标注 "TOUCHED" 时刻 + barrier 虚线
+    - 输出 PNG + CSV
+  - **报告生成** (`touch/report_generator.py`):
+    - `generate_report()` — 从观测结果自动生成量化机构标准 Markdown 报告
+    - 9 节结构: 执行摘要、模型描述、数据概览、预测表现 (Brier/BSS/Murphy/校准曲线)、交易表现 (多阈值 PnL/方向拆分)、逐 barrier 详情、时间维度、风险分析、局限性
+    - 交易模拟: 每 barrier 每小时限频、shrinkage + fee 计算、YES/NO 双向
+  - **CLI 入口** (`run_touch_backtest.py`):
+    - `--month`, `--step-minutes`, `--iv-source`, `--default-sigma`, `--mu`, `--vrp-k`
+    - `--download-only`, `--no-market-prices`, `--no-charts`, `--no-report`
+    - 自动生成报告 + 图表 + 控制台指标输出
+  - **基础设施扩展**:
+    - `pricing_core/time_utils.py` — 新增 `month_boundaries_utc_ms()` 月份边界计算
+    - `pricing_core/deribit_data.py` — `DeribitClient` 新增: `get_volatility_index_data()` (DVOL OHLC 历史), `get_dvol()` (当前 DVOL 指数), `get_historical_volatility()` (已实现波动率，供 VRP 校准用)
+  - **IV 来源修复**: 原错误调用 `get_historical_volatility` (已实现波动率 HV)，改为 `get_volatility_index_data` (DVOL 隐含波动率指数); `get_dvol()` 改用 `get_index_price(btc_dvol)` 替代错误的 `ticker(BTC-DVOL)`
+  - **IV 回退链**: option_chain (月底交割期权 ATM IV, 最精确但仅实时可用) → dvol (30天 ATM IV 指数 + 期限结构校正, 回测代理) → default_sigma (固定默认值); 所有 IV 乘以 vrp_k 做 Q→P 缩放; option_chain 模式每小时刷新一次 ATM IV 缓存
+  - **DVOL 期限结构校正**: `sigma_adj = dvol * (30 / T_days_remaining)^alpha`; alpha=0.05 (BTC 温和反向期限结构); 月初校正≈0%, 7天剩余+7.5%, 3天剩余+12%; clamp T_days≥0.5 防极端值; `--term-alpha` CLI 参数
+  - **ATM IV 定期采集器** (`touch/iv_collector.py`): cron 每小时调用 `get_option_chain_by_expiry(month_end_ms)` 获取月底 ATM IV → 追加到 `data/deribit_iv/atm_iv_YYYY-MM.csv.gz`; 30分钟去重; 与 DeribitIVCache 格式兼容; ATM IV 数据自动合并覆盖同期 DVOL（更精确）
+  - **市场发现解析修复**: `parse_direction_from_question()` 新增 "dip/drop/fall/crash" → down, "reach" → up 模式（原只匹配 "or above/below"）
+  - **2026-01 回测报告**: Brier 模型 0.074 vs 市场 0.086 (14.4% 优); BSS 0.37 vs 0.27; 所有概率区间模型均优; 5% edge 阈值 1764 笔交易胜率 64.6% PnL/份 +$0.28; Murphy 分解显示优势来自更好的校准 (Reliability 0.009 vs 0.020)
+  - **测试**: 70 个新测试全部通过; 517/517 全量通过
+    - `test_barrier_pricing.py` — 29 个: 已知值、边界条件、单调性 (strike/time/sigma)、概率范围、BTC 实际参数
+    - `test_touch_iv_source.py` — 7 个: 数据查询、防前瞻偏差、百分比转换、缓存持久化
+    - `test_touch_market_discovery.py` — 13 个: barrier/direction/month 解析、缓存加载
+    - `test_touch_backtest_engine.py` — 11 个: running extremes、bisect 查找、IV 回退、VRP 缩放、合成数据完整回测、指标计算、月份边界
+  - 507/507 全量测试通过 (5 skipped)
+
+- **市场价格漂移分析 — 买入后 mid-price 方向性漂移** — 扩展收敛分析，增加不含 spread 成本的方向性指标:
+  - `backtest/convergence.py` — HOLDINGS 新增 4h(240min); `HoldingPeriodResult` 新增 `n_favorable`/`favorable_rate`/`avg_mid_drift`/`median_mid_drift` 四字段（默认值=0 向后兼容）; 新增 `compute_exit_mid_drift()` 和 `compute_settlement_mid_drift()` mid-price 漂移计算; `aggregate_holding_period()` 新增 `mid_drifts` 参数; `run_convergence()` 内部同时计算 PnL 和 mid drift
+  - `backtest/convergence_chart.py` — 新建收敛可视化模块: 上半图折线(favorable_rate vs win_rate, ALL/YES/NO 三色), 下半图分组柱状(avg_mid_drift), 50% 基线参考线
+  - `run_convergence.py` — 总体表新增 `FavR%`/`AvgDrift` 列; 方向拆分表新增 `FavR%` 列; CSV 新增 4 列; 新增 `--chart` 参数触发图表生成; import `plot_convergence`
+  - `tests/test_convergence.py` — 新增 15 个测试: `TestComputeExitMidDrift`(6), `TestComputeSettlementMidDrift`(4), `TestAggregateWithMidDrifts`(3), `TestConvergenceChart`(1), `TestRunConvergence.test_mid_drift_populated`(1)
+  - 48/48 tests passing
+  - 关键发现 (threshold=0.03, 327,383 signals, 73 天):
+    - **Alpha 本质是结算预测，非价格收敛**: 所有中途退出均亏损（6h ALL 仍 -$300k），只有持有到结算才盈利（+$311k）。模型的 alpha = 71.5% 的二元结算方向预测准确率，不存在可交易的中途收敛机会
+    - **FavR%-WinR% 差距 = spread 成本**: 30m 时 FavR%=52.7% 但 WinR%=29.0%（差 23.7pp），说明 mid 方向对了但 spread 完全吃掉利润；差距随持有期缩小（6h 差 6.7pp），结算时归零
+    - **NO 有真实方向 alpha**: NO FavR% 从 53.2%(30m) 单调升至 75.8%(结算)，avg_mid_drift 全程为正且递增；YES FavR% 也 >50% 但 drift 极低，settlement 转负（-0.04），所有持有期 PnL 均负
+    - **Polymarket spread 定价高效**: mid 方向对了 53-65% 但 PnL 为负，说明做市商精确定价了信息优势的价值
+    - **策略启示**: 中途退出永远是错的；没有"快进快出"可能性；全部价值 = 持有到结算的预测准确率
+
 ## Next Steps (Phase B+)
 - Deribit smile shape integration (SVI fitting, variance scaling)
 - VRP calibration (rolling k estimation, regime classification)

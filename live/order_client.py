@@ -9,6 +9,7 @@ Polymarket 订单客户端
 """
 
 import logging
+import os
 import sys
 import time
 from typing import Optional
@@ -17,8 +18,10 @@ from .config import LiveTradingConfig
 
 logger = logging.getLogger(__name__)
 
-# 添加 py-clob-client 到路径
-_CLOB_CLIENT_PATH = "/home/ubuntu/pm_arb/libs/py-clob-client"
+# 添加 py-clob-client 到路径（优先环境变量，回退默认路径）
+_CLOB_CLIENT_PATH = os.environ.get(
+    "PY_CLOB_CLIENT_PATH", "/home/ubuntu/pm_arb/libs/py-clob-client"
+)
 if _CLOB_CLIENT_PATH not in sys.path:
     sys.path.insert(0, _CLOB_CLIENT_PATH)
 
@@ -97,11 +100,15 @@ class PolymarketOrderClient:
         """
         ot = OrderType.FOK if order_type == "FOK" else OrderType.GTC
 
+        # 查询市场 fee rate（避免 OrderArgs 默认 0 跳过自动解析）
+        fee_rate = self._client.get_fee_rate_bps(token_id)
+
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=size,
             side=side,
+            fee_rate_bps=fee_rate,
         )
 
         options = PartialCreateOrderOptions(

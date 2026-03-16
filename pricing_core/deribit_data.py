@@ -5,7 +5,7 @@ Deribit 数据模块
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -184,3 +184,93 @@ class DeribitClient:
         filtered = [q for q in all_quotes if q.expiry_timestamp == target_expiry]
         logger.info(f"筛选到期日 {target_expiry}: {len(filtered)} 条报价")
         return sorted(filtered, key=lambda q: q.strike)
+
+    def get_historical_volatility(self, currency: str = "BTC") -> List[Tuple[int, float]]:
+        """
+        获取历史已实现波动率 (HV) 数据
+
+        调用 public/get_historical_volatility 接口
+        返回逐小时的年化已实现波动率，百分比形式（如 50.10 = 50.10%）
+
+        Args:
+            currency: 币种（默认 BTC）
+
+        Returns:
+            [(timestamp_ms, hv_pct), ...] 按时间排序，hv_pct 为百分比形式
+        """
+        result = self._get("get_historical_volatility", {"currency": currency})
+        data = []
+        for row in result:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                ts_ms = int(row[0])
+                vol = float(row[1])
+                data.append((ts_ms, vol))
+        data.sort(key=lambda x: x[0])
+        logger.info(f"获取历史已实现波动率: {currency}, {len(data)} 条数据")
+        return data
+
+    def get_volatility_index_data(
+        self,
+        currency: str = "BTC",
+        start_timestamp: int = 0,
+        end_timestamp: int = 0,
+        resolution: int = 3600,
+    ) -> List[Tuple[int, float]]:
+        """
+        获取 DVOL（隐含波动率指数）历史数据
+
+        调用 public/get_volatility_index_data 接口
+        返回 OHLC 蜡烛数据，提取 close 值作为 DVOL
+
+        DVOL 值为百分比形式（如 50.76 = 50.76% 年化隐含波动率）
+
+        Args:
+            currency: 币种（默认 BTC）
+            start_timestamp: 起始时间 (UTC ms)
+            end_timestamp: 结束时间 (UTC ms)
+            resolution: 蜡烛间隔（秒），默认 3600 = 1小时
+
+        Returns:
+            [(timestamp_ms, dvol_pct), ...] 按时间排序，dvol_pct 为百分比形式
+        """
+        params = {"currency": currency, "resolution": resolution}
+        if start_timestamp > 0:
+            params["start_timestamp"] = start_timestamp
+        if end_timestamp > 0:
+            params["end_timestamp"] = end_timestamp
+
+        result = self._get("get_volatility_index_data", params)
+
+        # 响应格式: {"data": [[ts_ms, open, high, low, close], ...], ...}
+        raw_data = result.get("data", []) if isinstance(result, dict) else result
+        data = []
+        for row in raw_data:
+            if isinstance(row, (list, tuple)) and len(row) >= 5:
+                ts_ms = int(row[0])
+                close = float(row[4])  # OHLC 的 close
+                data.append((ts_ms, close))
+        data.sort(key=lambda x: x[0])
+        logger.info(f"获取 DVOL 历史: {currency}, {len(data)} 条数据, "
+                     f"resolution={resolution}s")
+        return data
+
+    def get_dvol(self, currency: str = "BTC") -> Optional[float]:
+        """
+        获取当前 DVOL 指数值
+
+        通过 get_index_price 获取 btc_dvol 指数
+
+        Returns:
+            DVOL 百分比值（如 55.3 = 55.3%），或 None
+        """
+        try:
+            index_name = f"{currency.lower()}_dvol"
+            result = self._get("get_index_price", {"index_name": index_name})
+            dvol = float(result.get("index_price", 0))
+            if dvol > 0:
+                logger.debug(f"Deribit DVOL: {dvol:.2f}%")
+                return dvol
+            return None
+        except Exception as e:
+            logger.warning(f"获取 DVOL 失败: {e}")
+            return None

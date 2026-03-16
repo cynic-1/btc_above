@@ -48,7 +48,9 @@ class BinanceKlineFeed:
         self._rest_url = config.binance_rest_url.rstrip("/")
         self._limiter = TokenBucket(rate=config.binance_max_rps)
 
-        self._klines: List[Kline] = []  # 24h 滚动缓冲区
+        self._buffer_minutes = config.har_train_days * 24 * 60
+
+        self._klines: List[Kline] = []  # 滚动缓冲区（har_train_days 天）
         self._current_price: float = 0.0
         self._lock = threading.Lock()
         self._connected = threading.Event()
@@ -119,9 +121,9 @@ class BinanceKlineFeed:
     # ==================== 内部方法 ====================
 
     def _load_initial_klines(self) -> None:
-        """REST 获取 24h 历史 K线"""
+        """REST 获取历史 K线（har_train_days 天）"""
         now_ms = int(time.time() * 1000)
-        start_ms = now_ms - _24H_MINUTES * 60 * 1000
+        start_ms = now_ms - self._buffer_minutes * 60 * 1000
 
         all_klines: List[Kline] = []
         cursor = start_ms
@@ -253,7 +255,7 @@ class BinanceKlineFeed:
             elif open_time > last.open_time:
                 # 新 K线
                 self._klines.append(kline)
-                # 保持 24h 窗口
-                cutoff = open_time - _24H_MINUTES * 60 * 1000
+                # 保持 har_train_days 窗口
+                cutoff = open_time - self._buffer_minutes * 60 * 1000
                 while self._klines and self._klines[0].open_time < cutoff:
                     self._klines.pop(0)

@@ -66,3 +66,29 @@ def utc_ms_to_datetime(utc_ms: int) -> datetime:
 def minutes_until_event(now_utc_ms: int, event_utc_ms: int) -> float:
     """计算距离事件的分钟数"""
     return (event_utc_ms - now_utc_ms) / 60_000
+
+
+def month_boundaries_utc_ms(month_str: str) -> tuple:
+    """
+    计算月份的起止 UTC 毫秒时间戳
+
+    Args:
+        month_str: 月份字符串，格式 "YYYY-MM"
+
+    Returns:
+        (month_start_ms, month_end_ms)
+        month_start = 该月 1 日 00:00:00 UTC
+        month_end = 该月最后一天 23:59:59.999 UTC
+    """
+    import calendar
+    year, month = map(int, month_str.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+
+    start_dt = datetime(year, month, 1, tzinfo=UTC)
+    end_dt = datetime(year, month, last_day, 23, 59, 59, 999000, tzinfo=UTC)
+
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    logger.debug(f"month_boundaries({month_str}): {start_ms} ~ {end_ms}")
+    return start_ms, end_ms

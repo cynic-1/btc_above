@@ -163,7 +163,9 @@ class TestComputeAllMetrics:
 
 class TestSimulatePortfolio:
     def _make_obs(self, p_phys, label, strike=90000.0, market_price=0.5,
-                  obs_minutes=60, now_utc_ms=1000):
+                  obs_minutes=60, now_utc_ms=1000, spread=0.02):
+        bid = market_price - spread / 2
+        ask = market_price + spread / 2
         return ObservationResult(
             event_date="2026-02-15",
             obs_minutes=obs_minutes,
@@ -174,6 +176,7 @@ class TestSimulatePortfolio:
             predictions={strike: p_phys},
             labels={strike: label},
             market_prices={strike: market_price},
+            market_bid_ask={strike: (bid, ask)},
         )
 
     def test_no_trade_below_threshold(self):
@@ -185,22 +188,22 @@ class TestSimulatePortfolio:
 
     def test_buy_yes_wins(self):
         """模型高于市场 → BUY YES, 结算 YES → 盈利"""
-        # model=0.80, market=0.50, edge=0.30 > 0.03
-        # 买 200 份 YES @ $0.50, 成本=$100, 结算 YES → 赔付 $200, pnl=$100
+        # model=0.80, bid=0.49, ask=0.51, edge=0.80-0.51=0.29 > 0.03
+        # 买 200 份 YES @ ask=$0.51, 成本=$102, 结算 YES → 赔付 $200, pnl=$98
         obs = self._make_obs(0.80, 1, market_price=0.50)
         result = simulate_portfolio([obs], shares_per_trade=200)
         assert result["n_trades"] == 1
         assert result["n_markets"] == 1
-        assert result["total_pnl"] == pytest.approx(100.0)
+        assert result["total_pnl"] == pytest.approx(98.0)
 
     def test_buy_no_wins(self):
         """市场高于模型 → BUY NO, 结算 NO → 盈利"""
-        # model=0.20, market=0.50, edge=-0.30 < -0.03
-        # 买 200 份 NO @ $0.50, 成本=$100, 结算 NO → 赔付 $200, pnl=$100
+        # model=0.20, bid=0.49, ask=0.51, edge=bid-model=0.49-0.20=0.29 > 0.03
+        # 买 200 份 NO @ (1-bid)=$0.51, 成本=$102, 结算 NO → 赔付 $200, pnl=$98
         obs = self._make_obs(0.20, 0, market_price=0.50)
         result = simulate_portfolio([obs], shares_per_trade=200)
         assert result["n_trades"] == 1
-        assert result["total_pnl"] == pytest.approx(100.0)
+        assert result["total_pnl"] == pytest.approx(98.0)
 
     def test_net_position_limit(self):
         """多个同方向观测，验证净仓位不超限"""
@@ -221,6 +224,41 @@ class TestSimulatePortfolio:
         assert result["n_trades"] == 2
         assert result["markets"][0]["yes_shares"] == 400
 
+    def test_skip_when_bid_equals_ask(self):
+        """bid==ask（无真实价差）时应跳过交易"""
+        # market_bid_ask = (0.50, 0.50) → bid==ask → skip
+        obs = ObservationResult(
+            event_date="2026-02-15",
+            obs_minutes=60,
+            now_utc_ms=1000,
+            s0=89000.0,
+            settlement_price=91000.0,
+            k_grid=[90000.0],
+            predictions={90000.0: 0.80},
+            labels={90000.0: 1},
+            market_prices={90000.0: 0.50},
+            market_bid_ask={90000.0: (0.50, 0.50)},
+        )
+        result = simulate_portfolio([obs], shares_per_trade=200)
+        assert result["n_trades"] == 0
+
+    def test_skip_when_no_bid_ask(self):
+        """无 market_bid_ask 时应跳过交易"""
+        obs = ObservationResult(
+            event_date="2026-02-15",
+            obs_minutes=60,
+            now_utc_ms=1000,
+            s0=89000.0,
+            settlement_price=91000.0,
+            k_grid=[90000.0],
+            predictions={90000.0: 0.80},
+            labels={90000.0: 1},
+            market_prices={90000.0: 0.50},
+            market_bid_ask={},
+        )
+        result = simulate_portfolio([obs], shares_per_trade=200)
+        assert result["n_trades"] == 0
+
     def test_market_summary(self):
         """验证返回 markets 结构字段完整"""
         obs = self._make_obs(0.80, 1, market_price=0.50)
@@ -233,9 +271,9 @@ class TestSimulatePortfolio:
         assert mkt["strike"] == 90000.0
         assert mkt["settlement"] == "YES"
         assert mkt["yes_shares"] == 200
-        assert mkt["yes_avg_price"] == pytest.approx(0.50)
+        assert mkt["yes_avg_price"] == pytest.approx(0.51)  # ask = 0.50 + 0.01
         assert mkt["no_shares"] == 0
-        assert mkt["pnl"] == pytest.approx(100.0)
+        assert mkt["pnl"] == pytest.approx(98.0)  # 200 * (1 - 0.51)
         assert len(mkt["trades"]) == 1
 
         # 顶级字段

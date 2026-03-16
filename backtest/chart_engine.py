@@ -115,8 +115,8 @@ class FastPricingEngine:
         self._client.set_now(now_utc_ms)
         s0 = self._client.get_current_price()
 
-        # 2. 获取 24h K线
-        lookback_ms = 24 * 60 * 60 * 1000
+        # 2. 获取 24h+1min K线（多取 1 条，确保差分后 returns >= 1440）
+        lookback_ms = 24 * 60 * 60 * 1000 + 60_000
         klines = self._client.get_klines_extended(
             start_ms=now_utc_ms - lookback_ms,
             end_ms=now_utc_ms,

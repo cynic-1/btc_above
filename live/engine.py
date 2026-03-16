@@ -94,9 +94,9 @@ class LiveTradingEngine:
             logger.error("Binance K线流启动失败，退出")
             return
 
-        # 3. 训练 HAR 系数
+        # 3. 训练 HAR 系数（排除事件日当天数据，与回测一致）
         klines = self._binance_feed.get_klines()
-        self._pricing_engine.train_har(klines)
+        self._pricing_engine.train_har(klines, self._config.event_date)
 
         # 4. 初始化订单客户端
         if not self._config.dry_run:
@@ -274,7 +274,7 @@ class LiveTradingEngine:
             if now_time - last_order < self._config.order_cooldown_seconds:
                 continue
 
-            # YES 方向: model > ask → BUY YES（与回测 elif 互斥）
+            # YES 方向: model > ask → BUY YES（按 best_bid 挂单）
             if edge_yes > threshold and best_ask < 0.99:
                 sig = Signal(
                     strike=market.strike,
@@ -286,7 +286,7 @@ class LiveTradingEngine:
                     market_price=best_ask,
                     edge=edge_yes,
                     shares=self._config.shares_per_trade,
-                    price=best_ask,
+                    price=best_bid,
                     timestamp_ms=now_utc_ms,
                 )
                 signals.append(sig)
@@ -303,7 +303,7 @@ class LiveTradingEngine:
                     market_price=1 - best_bid,
                     edge=edge_no,
                     shares=self._config.shares_per_trade,
-                    price=1 - best_bid,
+                    price=1 - best_ask,
                     timestamp_ms=now_utc_ms,
                 )
                 signals.append(sig)

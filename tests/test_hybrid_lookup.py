@@ -121,8 +121,8 @@ class TestHybridStaleOrderbook:
         price = hybrid.get_price_at(cid, 5000)
         assert price == 0.75  # CLOB 的价格
 
-    def test_stale_quote_from_clob(self):
-        """过期时 get_quote_at 从 CLOB 构造"""
+    def test_stale_quote_returns_none(self):
+        """过期时 get_quote_at 返回 None（不构造虚假报价）"""
         cid = "cid_stale_quote_1"
         ob_dir = tempfile.mkdtemp()
         clob_dir = tempfile.mkdtemp()
@@ -133,11 +133,47 @@ class TestHybridStaleOrderbook:
         hybrid = HybridPriceLookup(ob, clob, staleness_threshold_ms=2000)
         quote = hybrid.get_quote_at(cid, 5000)
 
-        assert quote is not None
-        # CLOB 无 bid/ask，用 price 填充
-        assert quote.best_bid == 0.80
-        assert quote.best_ask == 0.80
-        assert quote.mid_price == 0.80
+        assert quote is None
+
+
+class TestHybridStaleReturnsNone:
+    """orderbook 过期时 get_quote_at 返回 None（不构造虚假报价）"""
+
+    def test_stale_quote_returns_none(self):
+        """过期时 get_quote_at 应返回 None 而非合成 quote"""
+        cid = "cid_stale_none_01"
+        ob_dir = tempfile.mkdtemp()
+        clob_dir = tempfile.mkdtemp()
+
+        ob = _make_orderbook(ob_dir, cid, [(1000, 0.40, 0.60)])
+        clob = _make_clob(clob_dir, cid, [(5000, 0.80)])
+
+        hybrid = HybridPriceLookup(ob, clob, staleness_threshold_ms=2000)
+
+        # query_ts=5000, data_ts=1000, diff=4000 > 2000 → 过期
+        quote = hybrid.get_quote_at(cid, 5000)
+        assert quote is None
+
+    def test_stale_bid_ask_excluded(self):
+        """过期时 get_bid_ask_at 不包含该 strike"""
+        cid = "cid_stale_ba_no1"
+        ob_dir = tempfile.mkdtemp()
+        clob_dir = tempfile.mkdtemp()
+
+        ob = _make_orderbook(ob_dir, cid, [(1000, 0.40, 0.60)])
+        clob = _make_clob(clob_dir, cid, [(5000, 0.80)])
+
+        hybrid = HybridPriceLookup(ob, clob, staleness_threshold_ms=2000)
+        markets = {
+            ("2026-03-05", 85000.0): PolymarketMarketInfo(
+                event_date="2026-03-05", strike=85000.0,
+                condition_id=cid, yes_token_id="y", no_token_id="n",
+                question="test",
+            ),
+        }
+
+        ba = hybrid.get_bid_ask_at(markets, "2026-03-05", 5000, [85000.0])
+        assert 85000.0 not in ba
 
 
 class TestHybridSingleSource:
@@ -266,8 +302,8 @@ class TestHybridMarketPrices:
         assert 85000.0 in ba
         assert ba[85000.0] == (0.40, 0.60)
 
-    def test_bid_ask_stale(self):
-        """过期时 bid/ask 来自 CLOB（price == bid == ask）"""
+    def test_bid_ask_stale_excluded(self):
+        """过期时 get_bid_ask_at 不包含该 strike（quote 为 None）"""
         cid = "cid_ba_stale_001"
         ob_dir = tempfile.mkdtemp()
         clob_dir = tempfile.mkdtemp()
@@ -281,8 +317,7 @@ class TestHybridMarketPrices:
         ba = hybrid.get_bid_ask_at(
             markets, "2026-03-05", 5000, [85000.0],
         )
-        assert 85000.0 in ba
-        assert ba[85000.0] == (0.75, 0.75)
+        assert 85000.0 not in ba
 
 
 class TestHybridFirstTimestamp:

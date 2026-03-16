@@ -226,10 +226,10 @@ def simulate_portfolio(
 
                 # 确定 bid/ask 执行价（有订单簿时用 bid/ask，否则回退到 mid）
                 ba = obs.market_bid_ask.get(k)
-                if ba and ba[0] > 0 and ba[1] > 0:
+                if ba and ba[0] > 0 and ba[1] > 0 and ba[0] != ba[1]:
                     bid, ask = ba[0], ba[1]
                 else:
-                    bid, ask = market_price, market_price
+                    continue  # 无真实 bid/ask 或零价差时跳过
 
                 if k not in positions:
                     positions[k] = {

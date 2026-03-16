@@ -161,6 +161,17 @@ class BacktestEngine:
             vrp_k=pricing_config.vrp_default_k,
         )
 
+        # 预计算固定 strikes（从 Polymarket 市场发现）
+        fixed_strikes_by_date: Dict[str, List[float]] = {}
+        if (self.config.use_fixed_strikes
+                and self.config.use_market_prices
+                and self._poly_markets):
+            for (d, strike) in self._poly_markets:
+                fixed_strikes_by_date.setdefault(d, []).append(strike)
+            for d in fixed_strikes_by_date:
+                fixed_strikes_by_date[d] = sorted(fixed_strikes_by_date[d])
+            logger.info(f"固定 strikes: {len(fixed_strikes_by_date)} 个事件日")
+
         # 遍历事件日
         event_dates = _date_range(self.config.start_date, self.config.end_date)
         total_dates = len(event_dates)
@@ -205,6 +216,7 @@ class BacktestEngine:
                         now_ms=current_ms,
                         settlement=settlement,
                         har_coeffs=har_coeffs,
+                        fixed_strikes=fixed_strikes_by_date.get(event_date),
                     )
                     result.observations.append(obs)
                     obs_count += 1
@@ -258,13 +270,18 @@ class BacktestEngine:
         now_ms: int,
         settlement: float,
         har_coeffs: HARCoefficients,
+        fixed_strikes: Optional[List[float]] = None,
     ) -> ObservationResult:
         """运行单次观测（使用 FastPricingEngine）"""
         # 获取当前价格构建 K 网格
         hist_client.set_now(now_ms)
         s0 = hist_client.get_current_price()
-        base = round(s0 / 500) * 500
-        k_grid = [base + offset for offset in self.config.k_offsets]
+
+        if fixed_strikes is not None:
+            k_grid = fixed_strikes
+        else:
+            base = round(s0 / 500) * 500
+            k_grid = [base + offset for offset in self.config.k_offsets]
 
         # 运行快速定价
         s0_result, probs = engine.compute_for_timestep(

@@ -2,7 +2,7 @@
 """
 数据增量更新脚本
 
-自动发现新的 BTC above 事件 → 更新 events.json → 下载 CLOB 价格 → 下载 K线
+自动发现新的 BTC above 事件 → 更新 events.json → 下载 CLOB 价格 → 下载 K线 → 下载订单簿
 
 用法:
     python update_data.py                        # 更新到今天 +7 天
@@ -10,6 +10,7 @@
     python update_data.py --discover-only        # 仅发现新事件，不下载价格
     python update_data.py --prices-only          # 仅更新价格（不发现新事件）
     python update_data.py --klines-only          # 仅更新 K线缓存
+    python update_data.py --orderbooks-only      # 仅更新订单簿历史
 """
 
 import argparse
@@ -29,6 +30,7 @@ from backtest.polymarket_discovery import (
 )
 from backtest.polymarket_trades import PolymarketTradeCache
 from backtest.data_cache import KlineCache
+from backtest.dome_orderbook import DomeOrderbookFetcher
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +64,7 @@ def save_events(events: dict, path: str = EVENTS_JSON) -> None:
 
 def _search_gamma_events(
     date_str: str,
-    year: int = 2026,
+    year: int = None,
 ) -> Optional[dict]:
     """
     通过 Gamma API 搜索指定日期的 BTC above 事件
@@ -70,6 +72,8 @@ def _search_gamma_events(
     返回 events.json 格式的单日事件 dict，或 None
     """
     dt = datetime.strptime(date_str, "%Y-%m-%d")
+    if year is None:
+        year = dt.year
     month_name = dt.strftime("%B")
     day = dt.day
 
@@ -162,6 +166,7 @@ def _search_gamma_events(
 def discover_new_events(
     until_date: str,
     events: dict,
+    since_date: str = None,
 ) -> Tuple[dict, int]:
     """
     发现 events.json 中缺失的事件日
@@ -169,23 +174,26 @@ def discover_new_events(
     Args:
         until_date: 搜索截止日期 (含)
         events: 现有事件字典
+        since_date: 搜索起始日期 (含)，默认从现有最后日期+1 开始
 
     Returns:
         (更新后的 events, 新发现天数)
     """
     existing_dates = set(events.keys())
+    end_dt = datetime.strptime(until_date, "%Y-%m-%d")
 
-    # 确定搜索范围: 从最后已有日期的下一天 → until_date
-    if existing_dates:
+    if since_date:
+        # 指定起始日期: 搜索 since_date ~ until_date 中缺失的
+        start_dt = datetime.strptime(since_date, "%Y-%m-%d")
+    elif existing_dates:
+        # 默认: 从最后已有日期的下一天开始
         last_date = max(existing_dates)
         start_dt = datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
     else:
         start_dt = datetime(2026, 1, 1)
 
-    end_dt = datetime.strptime(until_date, "%Y-%m-%d")
-
     if start_dt > end_dt:
-        logger.info(f"events.json 已覆盖到 {last_date}，无需发现新事件")
+        logger.info(f"搜索范围为空 ({start_dt:%Y-%m-%d} > {end_dt:%Y-%m-%d})")
         return events, 0
 
     # 逐日搜索
@@ -237,11 +245,25 @@ def update_clob_prices(
                 cid_map[cid] = (token_ids[0], date_str, strike)
 
     # 筛选需要下载的
+    # 对已结算事件（event_date <= 今天），若缓存文件在事件日之前生成则需重新下载
     if force:
         to_download = list(cid_map.items())
     else:
-        to_download = [(cid, info) for cid, info in cid_map.items()
-                       if not cache.has_trades(cid)]
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        to_download = []
+        for cid, info in cid_map.items():
+            token_id, date_str, strike = info
+            if not cache.has_trades(cid):
+                to_download.append((cid, info))
+            elif date_str <= today_str:
+                # 已结算事件：缓存文件须在事件日之后写入才算完整
+                # （结算在 ET noon ≈ UTC 16:00，用 event_date+1d 作为安全阈值）
+                fpath = cache._file_path(cid)
+                mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
+                event_next_day = datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)
+                if mtime < event_next_day:
+                    logger.info(f"缓存过期 (事件日 {date_str}, 缓存于 {mtime:%Y-%m-%d %H:%M}): 重新下载")
+                    to_download.append((cid, info))
 
     if not to_download:
         logger.info(f"CLOB 价格缓存完整 ({len(cid_map)} 个合约)")
@@ -301,11 +323,100 @@ def update_klines(
     return len(downloaded)
 
 
+# ── 4. 订单簿更新 ─────────────────────────────────────────────
+
+
+def update_orderbooks(
+    events: dict,
+    bearer_token: str,
+    cache_dir: str = "data/orderbook_cache",
+    lookback_hours: int = 24,
+    force: bool = False,
+) -> int:
+    """
+    从 Dome API 下载历史订单簿快照
+
+    对每个已结算合约（event_date < 今天），下载结算前 lookback_hours 小时的订单簿。
+    自动检测不完整缓存（最后快照距结算 > 1h）并重新下载。
+
+    Returns:
+        新下载的合约数
+    """
+    from pricing_core.time_utils import et_noon_to_utc_ms
+
+    fetcher = DomeOrderbookFetcher(
+        bearer_token=bearer_token,
+        cache_dir=cache_dir,
+    )
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # 收集需要下载的合约: (cid, token_id, start_ms, end_ms, date_str, strike)
+    to_download = []
+    total = 0
+    incomplete = 0
+
+    for date_str, event in sorted(events.items()):
+        # 只下载已结算事件: event_date < 今天（严格小于，确保结算已完成）
+        if date_str >= today_str:
+            continue
+
+        settlement_ms = et_noon_to_utc_ms(date_str)
+        start_ms = settlement_ms - lookback_hours * 3600 * 1000
+        # 结算后 1 小时（包含结算后交易）
+        end_ms = settlement_ms + 1 * 3600 * 1000
+
+        for mkt in event.get("markets", []):
+            cid = mkt.get("conditionId", "")
+            token_ids = mkt.get("clobTokenIds", [])
+            if not cid or len(token_ids) < 2:
+                continue
+
+            total += 1
+            strike = parse_strike_from_question(mkt.get("question", "")) or 0
+
+            if force:
+                to_download.append((cid, token_ids[0], start_ms, end_ms, date_str, strike))
+                continue
+
+            # 完整性检查: 数据须覆盖到结算前 1h 以内
+            if not fetcher.is_cache_complete(cid, settlement_ms):
+                reason = "缺失" if not fetcher.has_cache(cid) else "不完整"
+                logger.info(f"缓存{reason}: {date_str} K={strike:.0f} → 重新下载")
+                incomplete += 1
+                to_download.append((cid, token_ids[0], start_ms, end_ms, date_str, strike))
+
+    if not to_download:
+        logger.info(f"订单簿缓存完整 ({total} 个已结算合约)")
+        return 0
+
+    logger.info(
+        f"下载订单簿: {len(to_download)}/{total} 个合约 "
+        f"(lookback={lookback_hours}h, 其中 {incomplete} 个不完整缓存)"
+    )
+
+    success = 0
+    for i, (cid, token_id, start_ms, end_ms, date_str, strike) in enumerate(to_download):
+        logger.info(f"  [{i + 1}/{len(to_download)}] {date_str} K={strike:.0f}")
+        count = fetcher.download_and_cache(cid, token_id, start_ms, end_ms)
+        if count > 0:
+            success += 1
+        if i < len(to_download) - 1:
+            time.sleep(0.3)
+
+    logger.info(f"订单簿下载完成: {success}/{len(to_download)} 成功")
+    return success
+
+
 # ── CLI ───────────────────────────────────────────────────────
 
 
 def main():
     parser = argparse.ArgumentParser(description="数据增量更新")
+    parser.add_argument(
+        "--since",
+        help="事件发现起始日期 (YYYY-MM-DD)，向前扩展搜索范围",
+    )
     parser.add_argument(
         "--until",
         help="事件发现截止日期 (YYYY-MM-DD)，默认今天 +7 天",
@@ -327,8 +438,20 @@ def main():
         help="仅更新 K线缓存",
     )
     parser.add_argument(
+        "--orderbooks-only", action="store_true",
+        help="仅更新订单簿历史 (Dome API)",
+    )
+    parser.add_argument(
         "--force-prices", action="store_true",
         help="强制重新下载所有 CLOB 价格",
+    )
+    parser.add_argument(
+        "--force-orderbooks", action="store_true",
+        help="强制重新下载所有订单簿",
+    )
+    parser.add_argument(
+        "--ob-lookback-hours", type=int, default=24,
+        help="订单簿下载时间范围: 结算前多少小时 (默认: 24)",
     )
     parser.add_argument(
         "--polymarket-cache-dir", default="data/polymarket",
@@ -337,6 +460,10 @@ def main():
     parser.add_argument(
         "--klines-cache-dir", default="data/klines",
         help="K线缓存目录",
+    )
+    parser.add_argument(
+        "--orderbook-cache-dir", default="data/orderbook_cache",
+        help="订单簿缓存目录",
     )
     args = parser.parse_args()
 
@@ -350,11 +477,11 @@ def main():
     logger.info(f"现有事件: {len(events)} 天 ({min(events.keys()) if events else 'N/A'} ~ {max(events.keys()) if events else 'N/A'})")
 
     # 选择性执行
-    only_mode = args.discover_only or args.prices_only or args.klines_only
+    only_mode = args.discover_only or args.prices_only or args.klines_only or args.orderbooks_only
 
     # Step 1: 发现新事件
-    if not args.prices_only and not args.klines_only:
-        events, new_events = discover_new_events(until_date, events)
+    if not args.prices_only and not args.klines_only and not args.orderbooks_only:
+        events, new_events = discover_new_events(until_date, events, since_date=args.since)
         if new_events > 0:
             save_events(events, args.events_json)
             logger.info(f"新发现 {new_events} 个事件日")
@@ -365,7 +492,7 @@ def main():
             return
 
     # Step 2: 更新 CLOB 价格
-    if not args.discover_only and not args.klines_only:
+    if not args.discover_only and not args.klines_only and not args.orderbooks_only:
         # 如果 --prices-only + --force-prices，重新下载之前空的缓存
         new_prices = update_clob_prices(
             events,
@@ -378,12 +505,32 @@ def main():
             return
 
     # Step 3: 更新 K线
-    if not args.discover_only and not args.prices_only:
+    if not args.discover_only and not args.prices_only and not args.orderbooks_only:
         new_klines = update_klines(
             events,
             cache_dir=args.klines_cache_dir,
         )
         logger.info(f"K线更新: {new_klines} 天新下载")
+
+        if args.klines_only:
+            return
+
+    # Step 4: 更新订单簿
+    if not args.discover_only and not args.prices_only and not args.klines_only:
+        from dotenv import load_dotenv
+        load_dotenv()
+        bearer_token = os.getenv("BEARER_TOKEN", "")
+        if not bearer_token:
+            logger.warning("未设置 BEARER_TOKEN，跳过订单簿更新")
+        else:
+            new_ob = update_orderbooks(
+                events,
+                bearer_token=bearer_token,
+                cache_dir=args.orderbook_cache_dir,
+                lookback_hours=args.ob_lookback_hours,
+                force=args.force_orderbooks,
+            )
+            logger.info(f"订单簿更新: {new_ob} 个新下载")
 
     logger.info("全部更新完成!")
 

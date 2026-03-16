@@ -51,16 +51,8 @@ class HybridPriceLookup:
         """返回完整报价（仅 orderbook 新鲜时可用，否则从 CLOB 构造）"""
         if not self._is_stale(condition_id, timestamp_ms):
             return self.orderbook.get_quote_at(condition_id, timestamp_ms)
-        # CLOB 无 bid/ask，用 price 构造近似 quote
-        price = self.clob.get_price_at(condition_id, timestamp_ms)
-        if price is None:
-            return None
-        return OrderbookQuote(
-            timestamp_ms=timestamp_ms,
-            best_bid=price,
-            best_ask=price,
-            mid_price=price,
-        )
+        # orderbook 过期时不构造虚假报价，返回 None
+        return None
 
     def get_market_prices_at(
         self,

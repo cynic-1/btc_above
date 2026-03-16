@@ -77,3 +77,6 @@ class BacktestConfig:
     # 交易冷却期（分钟）: 同一 (date, strike) 两次交易间最少等待分钟数
     # 0 = 禁用（每分钟都可交易），30 = 每 30 分钟最多交易一次
     cooldown_minutes: int = 0
+
+    # 使用固定 strike（从 Polymarket 市场发现），而非动态 K 网格
+    use_fixed_strikes: bool = True

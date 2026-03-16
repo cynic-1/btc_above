@@ -73,6 +73,7 @@ class TestBacktestEngine:
             k_offsets=[0, 500],     # 减少 K 数量
             mc_samples=1000,        # 减少 MC 采样加速
             har_train_days=30,
+            use_market_prices=False,  # 不使用 Polymarket
         )
         engine = BacktestEngine(config=config, cache=self.cache)
         result = engine.run()
@@ -108,6 +109,50 @@ class TestBacktestEngine:
         assert isinstance(client, HistoricalBinanceClient)
         assert len(client._klines) > 0
 
+    def test_fixed_strikes_overrides_dynamic_grid(self):
+        """use_fixed_strikes=True 时应使用 Polymarket 市场的 strikes"""
+        config = BacktestConfig(
+            start_date="2026-02-01",
+            end_date="2026-02-02",
+            cache_dir=self.tmpdir,
+            output_dir=self.output_dir,
+            step_minutes=60,
+            lookback_hours=1,
+            k_offsets=[0, 500],
+            mc_samples=500,
+            har_train_days=30,
+            use_market_prices=True,
+            use_fixed_strikes=True,
+        )
+        engine = BacktestEngine(config=config, cache=self.cache)
+
+        # 模拟 Polymarket 市场数据
+        from backtest.polymarket_discovery import PolymarketMarketInfo
+        engine._poly_markets = {
+            ("2026-02-01", 88000.0): PolymarketMarketInfo(
+                event_date="2026-02-01", strike=88000.0,
+                condition_id="cid1", yes_token_id="y1", no_token_id="n1",
+                question="test",
+            ),
+            ("2026-02-01", 92000.0): PolymarketMarketInfo(
+                event_date="2026-02-01", strike=92000.0,
+                condition_id="cid2", yes_token_id="y2", no_token_id="n2",
+                question="test",
+            ),
+        }
+
+        # Mock price_lookup 使其不执行实际查询
+        mock_lookup = MagicMock()
+        mock_lookup.get_market_prices_at.return_value = {}
+        mock_lookup.get_bid_ask_at.return_value = {}
+        engine._price_lookup = mock_lookup
+
+        result = engine.run()
+
+        # 验证 k_grid 使用了固定 strikes 而非动态网格
+        obs = result.observations[0]
+        assert obs.k_grid == [88000.0, 92000.0]
+
     def test_no_lookahead_bias(self):
         """验证无前视偏差: 观测时刻在事件之前"""
         config = BacktestConfig(
@@ -119,6 +164,7 @@ class TestBacktestEngine:
             k_offsets=[0],
             mc_samples=500,
             har_train_days=30,
+            use_market_prices=False,
         )
         engine = BacktestEngine(config=config, cache=self.cache)
         result = engine.run()

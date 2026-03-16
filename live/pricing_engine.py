@@ -7,9 +7,11 @@
 
 import logging
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pytz
 
 from pricing_core.binance_data import Kline
 from pricing_core.distribution import fit_student_t
@@ -77,11 +79,16 @@ class LivePricingEngine:
         Returns:
             {strike: probability}
         """
-        if len(klines) < 60:
-            logger.warning(f"K线数据不足: {len(klines)} < 60，跳过定价")
+        if not k_list:
             return {}
 
-        if not k_list:
+        # 过滤 K线到最近 24h+1min（多取 1 条，确保差分后 returns >= 1440）
+        lookback_ms = 24 * 60 * 60 * 1000 + 60_000
+        cutoff_ms = now_utc_ms - lookback_ms
+        klines = [k for k in klines if k.open_time >= cutoff_ms]
+
+        if len(klines) < 60:
+            logger.warning(f"K线数据不足: {len(klines)} < 60，跳过定价")
             return {}
 
         # 1. 计算 log returns
@@ -155,13 +162,25 @@ class LivePricingEngine:
 
         return result
 
-    def train_har(self, klines: List[Kline]) -> None:
+    def train_har(self, klines: List[Kline], event_date: str) -> None:
         """
         用历史 K线训练 HAR 系数
 
+        与回测 har_trainer 一致：排除 event_date 当天数据，
+        仅用 event_date 前的数据训练
+
         Args:
             klines: 历史 K线数据（至少需要 train_days 天）
+            event_date: 事件日期 "YYYY-MM-DD"，当天数据不参与训练
         """
+        # 排除事件日当天数据（与回测 har_trainer 一致）
+        midnight_utc_ms = int(
+            datetime.strptime(event_date, "%Y-%m-%d")
+            .replace(tzinfo=pytz.utc)
+            .timestamp() * 1000
+        )
+        klines = [k for k in klines if k.open_time < midnight_utc_ms]
+
         if len(klines) < _HAR_WINDOWS[-1] + _HAR_FORWARD_HORIZON + 100:
             logger.warning(
                 f"训练数据不足: {len(klines)} 条 K线，使用默认系数"
