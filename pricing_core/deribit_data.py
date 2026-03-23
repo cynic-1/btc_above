@@ -66,7 +66,7 @@ class DeribitClient:
         Returns:
             指数价格
         """
-        result = self._get("get_index_price", {"index_name": f"btc_usd"})
+        result = self._get("get_index_price", {"index_name": f"{currency.lower()}_usd"})
         price = result["index_price"]
         logger.debug(f"Deribit index price: {price}")
         return float(price)
