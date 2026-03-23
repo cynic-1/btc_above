@@ -53,6 +53,7 @@ class TouchObservationResult:
 class TouchBacktestConfig:
     """触碰期权回测配置"""
     month: str = "2026-03"
+    symbol: str = "BTC"  # 币种: "BTC" | "ETH"
 
     # 数据目录
     cache_dir: str = "data/klines"

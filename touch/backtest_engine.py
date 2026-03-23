@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 # 一年的毫秒数（365.25 天）
 _YEAR_MS = 365.25 * 86400 * 1000
 
+# 币种 → Polymarket slug 中的资产名称
+_SYMBOL_TO_ASSET = {"BTC": "bitcoin", "ETH": "ethereum"}
+
 
 class TouchBacktestEngine:
     """
@@ -51,7 +54,7 @@ class TouchBacktestEngine:
 
     def __init__(self, config: TouchBacktestConfig):
         self.config = config
-        self.cache = KlineCache(cache_dir=config.cache_dir)
+        self.cache = KlineCache(cache_dir=config.cache_dir, symbol=config.symbol)
         self.iv_cache = DeribitIVCache(cache_dir=config.iv_cache_dir)
 
         # 实时 IV 源（option_chain 模式使用）
@@ -116,7 +119,7 @@ class TouchBacktestEngine:
         if self.config.iv_source == "dvol":
             # DVOL 指数历史（30天滚动 ATM IV，回测用代理）
             # 注意: DVOL 是 30 天恒定到期 ATM IV 指数，与月底交割 IV 有 term structure 差异
-            if self.iv_cache.load():
+            if self.iv_cache.load(currency=self.config.symbol):
                 logger.info("IV 来源: DVOL 缓存 (30天滚动 ATM IV)")
                 return
 
@@ -124,12 +127,12 @@ class TouchBacktestEngine:
                 from pricing_core.deribit_data import DeribitClient
                 client = DeribitClient()
                 self.iv_cache.download_dvol_history(
-                    currency="BTC",
+                    currency=self.config.symbol,
                     start_ms=month_start_ms,
                     end_ms=month_end_ms,
                     deribit_client=client,
                 )
-                self.iv_cache.load()
+                self.iv_cache.load(currency=self.config.symbol)
             except Exception as e:
                 logger.warning(f"下载 DVOL 历史失败: {e}，将使用默认 sigma={self.config.default_sigma}")
         else:
@@ -150,7 +153,8 @@ class TouchBacktestEngine:
             9: "september", 10: "october", 11: "november", 12: "december",
         }
         month_name = month_names[month_num]
-        slug = f"what-price-will-bitcoin-hit-in-{month_name}-{year}"
+        asset_name = _SYMBOL_TO_ASSET.get(self.config.symbol, self.config.symbol.lower())
+        slug = f"what-price-will-{asset_name}-hit-in-{month_name}-{year}"
 
         cache_path = os.path.join(
             self.config.polymarket_cache_dir, f"touch_discovery_{self.config.month}.json"
@@ -372,7 +376,7 @@ class TouchBacktestEngine:
         # 3. 加载 IV 数据
         # 优先加载 ATM IV 缓存（iv_collector 采集），再加载 DVOL 缓存
         # ATM IV 数据会合并覆盖同期 DVOL（更精确）
-        self.iv_cache.load()
+        self.iv_cache.load(currency=self.config.symbol)
         self.iv_cache.load_atm_iv(self.config.month)
 
         # 4. 确定 barriers

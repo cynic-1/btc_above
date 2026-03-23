@@ -26,8 +26,9 @@ logger = logging.getLogger(__name__)
 class TouchChartGenerator:
     """触碰障碍期权回测图表生成器"""
 
-    def __init__(self, output_dir: str = "touch_backtest_results"):
+    def __init__(self, output_dir: str = "touch_backtest_results", symbol: str = "BTC"):
         self.output_dir = output_dir
+        self.symbol = symbol
 
     def generate(
         self,

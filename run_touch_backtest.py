@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BTC 触碰障碍期权回测")
+    parser = argparse.ArgumentParser(description="触碰障碍期权回测")
     parser.add_argument("--month", default="2026-03", help="回测月份 (YYYY-MM)")
     parser.add_argument("--cache-dir", default="data/klines", help="K线缓存目录")
     parser.add_argument("--iv-cache-dir", default="data/deribit_iv", help="DVOL 缓存目录")
@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--shrinkage", type=float, default=0.6, help="收缩系数 lambda")
     parser.add_argument("--term-alpha", type=float, default=0.05,
                         help="DVOL 期限结构校正指数 (0=不校正, 0.05=温和, 0.10=较陡)")
+    parser.add_argument("--symbol", default="BTC", choices=["BTC", "ETH"], help="币种 (默认 BTC)")
     parser.add_argument("--download-only", action="store_true", help="仅下载数据不跑回测")
     parser.add_argument("--no-market-prices", action="store_true", help="不使用 Polymarket 市场价格")
     parser.add_argument("--no-charts", action="store_true", help="不生成图表")
@@ -49,6 +50,7 @@ def main():
 
     config = TouchBacktestConfig(
         month=args.month,
+        symbol=args.symbol,
         cache_dir=args.cache_dir,
         iv_cache_dir=args.iv_cache_dir,
         output_dir=args.output_dir,
@@ -127,7 +129,7 @@ def main():
     # 生成图表
     if not args.no_charts:
         logger.info("生成图表...")
-        chart_gen = TouchChartGenerator(output_dir=config.output_dir)
+        chart_gen = TouchChartGenerator(output_dir=config.output_dir, symbol=config.symbol)
         chart_paths = chart_gen.generate(observations, args.month)
         print(f"  图表: {len(chart_paths)} 个文件 → {config.output_dir}/")
 
