@@ -44,20 +44,22 @@ class KlineCache:
     """
     K线缓存管理器
 
-    一天一个文件: BTCUSDT_1m_2026-01-15.csv.gz (1440 rows/day)
+    一天一个文件: {symbol}USDT_1m_2026-01-15.csv.gz (1440 rows/day)
     """
 
     def __init__(
         self,
         cache_dir: str = "data/klines",
+        symbol: str = "BTC",
         binance_client: Optional[BinanceClient] = None,
     ):
         self.cache_dir = cache_dir
+        self.symbol = symbol
         self.client = binance_client or BinanceClient()
         os.makedirs(cache_dir, exist_ok=True)
 
     def _file_path(self, date_str: str) -> str:
-        return os.path.join(self.cache_dir, f"BTCUSDT_1m_{date_str}.csv.gz")
+        return os.path.join(self.cache_dir, f"{self.symbol}USDT_1m_{date_str}.csv.gz")
 
     def _day_exists(self, date_str: str) -> bool:
         path = self._file_path(date_str)
@@ -82,6 +84,7 @@ class KlineCache:
         logger.info(f"下载 {date_str} K线数据...")
 
         all_klines = self.client.get_klines_extended(
+            symbol=f"{self.symbol}USDT",
             start_ms=day_start_ms,
             end_ms=day_end_ms,
         )
