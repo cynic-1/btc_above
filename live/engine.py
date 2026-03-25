@@ -59,6 +59,7 @@ class LiveTradingEngine:
         self._stop_event = threading.Event()
         self._trade_records: List[TradeRecord] = []
         self._last_order_time: Dict[str, float] = {}  # condition_id → 上次下单时间
+        self._pending_orders: Dict[str, dict] = {}  # order_id → {"signal", "placed_at"}
 
     def start(self) -> None:
         """初始化所有组件并启动主循环"""
@@ -162,6 +163,9 @@ class LiveTradingEngine:
                 for sig in signals:
                     self._execute_signal(sig)
 
+                # 检查超时挂单
+                self._check_pending_orders()
+
                 # 健康检查日志（每 60s 输出一次）
                 if int(time.time()) % 60 < self._config.pricing_interval_seconds:
                     health = self._health_check(mins_left)
@@ -219,6 +223,22 @@ class LiveTradingEngine:
             logger.warning("定价引擎返回空结果")
             return signals
 
+        # 时间窗口过滤（与回测 min/max_obs_minutes 对齐）
+        if mins_left < self._config.min_minutes_to_event or \
+           mins_left > self._config.max_minutes_to_event:
+            logger.debug(f"时间窗口外 T-{mins_left:.0f}min, 跳过")
+            return signals
+
+        # 方向过滤（与回测 direction_filter 对齐）
+        allow_yes = self._config.direction_filter != "no_only"
+        allow_no = self._config.direction_filter != "yes_only"
+
+        # 非对称阈值（与回测 yes_threshold/no_threshold 对齐）
+        eff_yes_threshold = self._config.yes_threshold if self._config.yes_threshold is not None \
+            else self._config.entry_threshold
+        eff_no_threshold = self._config.no_threshold if self._config.no_threshold is not None \
+            else self._config.entry_threshold
+
         # 3. 汇总定价 + orderbook + edge，构建扫描表
         scan_lines = []
         no_ob_count = 0
@@ -247,6 +267,15 @@ class LiveTradingEngine:
                 )
                 continue
 
+            # Spread 过滤（与回测 max_spread 对齐）
+            spread = best_ask - best_bid
+            if self._config.max_spread is not None and spread > self._config.max_spread:
+                scan_lines.append(
+                    f"  K={market.strike:>7.0f}  model={p_physical:.4f}  "
+                    f"bid/ask={best_bid:.3f}/{best_ask:.3f}  edge=--  (spread={spread:.3f}>max)"
+                )
+                continue
+
             # 直接用模型概率（与回测一致，不收缩）
             edge_yes = p_physical - best_ask
             edge_no = best_bid - p_physical
@@ -259,7 +288,7 @@ class LiveTradingEngine:
                 display_edge = edge_no
                 display_dir = "NO"
 
-            threshold = self._config.entry_threshold
+            threshold = max(eff_yes_threshold, eff_no_threshold)
             marker = " <--" if display_edge > threshold else ""
 
             scan_lines.append(
@@ -275,7 +304,7 @@ class LiveTradingEngine:
                 continue
 
             # YES 方向: model > ask → BUY YES（按 best_bid 挂单）
-            if edge_yes > threshold and best_ask < 0.99:
+            if allow_yes and edge_yes > eff_yes_threshold and best_ask < 0.99:
                 sig = Signal(
                     strike=market.strike,
                     condition_id=market.condition_id,
@@ -292,7 +321,7 @@ class LiveTradingEngine:
                 signals.append(sig)
 
             # NO 方向: bid > model → BUY NO（elif 互斥）
-            elif edge_no > threshold and best_bid > 0.01:
+            elif allow_no and edge_no > eff_no_threshold and best_bid > 0.01:
                 sig = Signal(
                     strike=market.strike,
                     condition_id=market.condition_id,
@@ -396,19 +425,65 @@ class LiveTradingEngine:
         )
         self._trade_records.append(record)
 
-        # FOK 订单只有 status=="matched" 才表示实际成交，
-        # 其他状态说明订单被 kill，不应计入仓位
-        if self._config.order_type == "FOK" and status != "matched":
-            logger.warning(
-                f"FOK 未成交: K={signal.strike:.0f} {signal.direction} "
-                f"shares={signal.shares} status={status}, 不计入仓位"
-            )
+        if self._config.order_type == "FOK":
+            # FOK: 只有 matched 才计入仓位
+            if status == "matched":
+                self._position_manager.record_trade(signal, status)
+            else:
+                logger.warning(
+                    f"FOK 未成交: K={signal.strike:.0f} {signal.direction} "
+                    f"shares={signal.shares} status={status}, 不计入仓位"
+                )
         else:
-            self._position_manager.record_trade(signal, status)
+            # GTC: 立即成交则记录 filled，否则加入 pending 等待超时取消
+            if status == "matched":
+                self._position_manager.record_trade(signal, status)
+            elif status != "failed":
+                self._position_manager.add_pending(signal, order_id)
+                self._pending_orders[order_id] = {
+                    "signal": signal,
+                    "placed_at": time.time(),
+                }
 
         self._last_order_time[signal.condition_id] = time.time()
 
         logger.info(f"下单结果: order_id={order_id}, status={status}")
+
+    def _check_pending_orders(self) -> None:
+        """检查超时的 GTC 挂单，取消并释放仓位"""
+        if not self._pending_orders:
+            return
+
+        timeout = self._config.order_timeout_seconds
+        now = time.time()
+        expired = [
+            (oid, info) for oid, info in self._pending_orders.items()
+            if now - info["placed_at"] >= timeout
+        ]
+
+        for order_id, info in expired:
+            signal = info["signal"]
+            age = now - info["placed_at"]
+
+            # 尝试取消
+            result = self._order_client.cancel_order(order_id)
+
+            if isinstance(result, dict) and "error" not in result:
+                # 取消成功 → 未成交，释放 pending 仓位
+                self._position_manager.cancel_pending(order_id)
+                logger.info(
+                    f"挂单超时取消: order_id={order_id} K={signal.strike:.0f} "
+                    f"{signal.direction} {signal.shares}份, 挂了{age:.0f}s"
+                )
+            else:
+                # 取消失败（可能已成交）→ 转为 filled
+                self._position_manager.confirm_fill(order_id)
+                logger.info(
+                    f"挂单已成交: order_id={order_id} K={signal.strike:.0f} "
+                    f"{signal.direction} {signal.shares}份"
+                )
+
+            del self._pending_orders[order_id]
 
     def _health_check(self, mins_left: float) -> dict:
         """健康检查"""

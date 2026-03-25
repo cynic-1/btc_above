@@ -6,6 +6,7 @@
 
 import os
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -46,6 +47,15 @@ class LiveTradingConfig:
     entry_threshold: float = 0.03
     order_type: str = "GTC"
     order_cooldown_seconds: float = 60.0  # 同市场每分钟最多下一单
+    order_timeout_seconds: float = 300.0  # GTC 挂单超时取消秒数 (默认 5 分钟)
+
+    # 交易过滤器（与回测对齐）
+    direction_filter: str = "both"                  # both / yes_only / no_only
+    yes_threshold: Optional[float] = None           # YES 方向独立阈值 (None=沿用 entry_threshold)
+    no_threshold: Optional[float] = None            # NO 方向独立阈值 (None=沿用 entry_threshold)
+    max_spread: Optional[float] = None              # 最大 bid-ask 价差 (None=不限)
+    min_minutes_to_event: int = 0                   # 距事件最少分钟数 (0=不限)
+    max_minutes_to_event: int = 99999               # 距事件最多分钟数 (99999=不限)
 
     # ==================== 定价 ====================
     mc_samples: int = 2000

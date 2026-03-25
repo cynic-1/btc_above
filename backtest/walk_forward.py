@@ -133,6 +133,7 @@ class WalkForwardValidator:
         shares_per_trade: int = 200,
         max_net_shares: int = 10_000,
         entry_threshold: float = 0.03,
+        **kwargs,
     ) -> WalkForwardResult:
         """
         在每个窗口的 test 期观测上计算指标
@@ -202,6 +203,7 @@ class WalkForwardValidator:
                 shares_per_trade=shares_per_trade,
                 max_net_shares=max_net_shares,
                 entry_threshold=entry_threshold,
+                **kwargs,
             )
             wf.pnl = portfolio["total_pnl"]
             wf.return_pct = portfolio["total_return_pct"]

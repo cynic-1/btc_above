@@ -64,6 +64,48 @@ def parse_args() -> argparse.Namespace:
         help="同市场下单冷却秒数 (default: 20)",
     )
     parser.add_argument(
+        "--order-timeout",
+        type=float,
+        default=300.0,
+        help="GTC 挂单超时取消秒数 (default: 300 = 5分钟)",
+    )
+    parser.add_argument(
+        "--direction",
+        choices=["both", "yes_only", "no_only"],
+        default="both",
+        help="方向过滤 (default: both)",
+    )
+    parser.add_argument(
+        "--yes-threshold",
+        type=float,
+        default=None,
+        help="YES 方向 edge 阈值 (default: 沿用 --entry-threshold)",
+    )
+    parser.add_argument(
+        "--no-threshold",
+        type=float,
+        default=None,
+        help="NO 方向 edge 阈值 (default: 沿用 --entry-threshold)",
+    )
+    parser.add_argument(
+        "--max-spread",
+        type=float,
+        default=None,
+        help="最大 bid-ask 价差过滤 (default: 不限)",
+    )
+    parser.add_argument(
+        "--min-minutes-to-event",
+        type=int,
+        default=0,
+        help="距事件最少分钟数 (default: 0)",
+    )
+    parser.add_argument(
+        "--max-minutes-to-event",
+        type=int,
+        default=99999,
+        help="距事件最多分钟数 (default: 99999)",
+    )
+    parser.add_argument(
         "--pricing-interval",
         type=float,
         default=10.0,
@@ -104,9 +146,16 @@ def main() -> None:
         entry_threshold=args.entry_threshold,
         order_type=args.order_type,
         order_cooldown_seconds=args.order_cooldown,
+        order_timeout_seconds=args.order_timeout,
         pricing_interval_seconds=args.pricing_interval,
         mc_samples=args.mc_samples,
         log_dir=args.log_dir,
+        direction_filter=args.direction,
+        yes_threshold=args.yes_threshold,
+        no_threshold=args.no_threshold,
+        max_spread=args.max_spread,
+        min_minutes_to_event=args.min_minutes_to_event,
+        max_minutes_to_event=args.max_minutes_to_event,
     )
 
     engine = LiveTradingEngine(config)

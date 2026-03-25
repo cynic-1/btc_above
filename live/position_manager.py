@@ -22,19 +22,31 @@ class PositionManager:
     - 按 condition_id 跟踪每个市场的 YES/NO 仓位
     - 检查净仓位限制 (max_net_shares)
     - 检查总成本限制 (max_total_cost)
-    - 下单前验证是否允许
-    - 成交后更新仓位
+    - 下单前验证是否允许（filled + pending 合计）
+    - pending 订单超时后可取消释放额度
     """
 
     def __init__(self, config: LiveTradingConfig):
         self._config = config
-        self._positions: Dict[str, Position] = {}
+        self._positions: Dict[str, Position] = {}  # filled 仓位
+        self._pending: Dict[str, Signal] = {}  # order_id → Signal（待成交）
         self._total_cost: float = 0.0
         self._lock = threading.Lock()
 
+    def _pending_net_for(self, condition_id: str) -> int:
+        """计算某市场 pending 订单的净仓位"""
+        net = 0
+        for sig in self._pending.values():
+            if sig.condition_id == condition_id:
+                if sig.direction == "YES" and sig.side == "BUY":
+                    net += sig.shares
+                elif sig.direction == "NO" and sig.side == "BUY":
+                    net -= sig.shares
+        return net
+
     def can_trade(self, signal: Signal) -> Tuple[bool, str]:
         """
-        检查是否允许下单
+        检查是否允许下单（考虑 filled + pending 仓位）
 
         Args:
             signal: 交易信号
@@ -52,30 +64,60 @@ class PositionManager:
                     f"限制={self._config.max_total_cost:.2f}"
                 )
 
-            # 2. 检查净仓位限制
+            # 2. 检查净仓位限制（filled + pending）
             pos = self._positions.get(signal.condition_id)
-            if pos is not None:
-                if signal.direction == "YES" and signal.side == "BUY":
-                    new_net = pos.net_shares + signal.shares
-                elif signal.direction == "NO" and signal.side == "BUY":
-                    new_net = pos.net_shares - signal.shares
-                else:
-                    new_net = pos.net_shares
+            filled_net = pos.net_shares if pos is not None else 0
+            pending_net = self._pending_net_for(signal.condition_id)
+            current_net = filled_net + pending_net
+
+            if signal.direction == "YES" and signal.side == "BUY":
+                new_net = current_net + signal.shares
+            elif signal.direction == "NO" and signal.side == "BUY":
+                new_net = current_net - signal.shares
             else:
-                if signal.direction == "YES" and signal.side == "BUY":
-                    new_net = signal.shares
-                elif signal.direction == "NO" and signal.side == "BUY":
-                    new_net = -signal.shares
-                else:
-                    new_net = 0
+                new_net = current_net
 
             if abs(new_net) > self._config.max_net_shares:
+                n_pending = sum(1 for s in self._pending.values()
+                                if s.condition_id == signal.condition_id)
                 return False, (
-                    f"净仓位超限: 新净仓={new_net}, "
+                    f"净仓位超限: filled={filled_net}, pending={pending_net}, "
+                    f"新净仓={new_net}, pending单数={n_pending}, "
                     f"限制=±{self._config.max_net_shares}"
                 )
 
             return True, "OK"
+
+    def add_pending(self, signal: Signal, order_id: str) -> None:
+        """GTC 订单已下单但未成交，加入 pending 追踪（占用仓位额度）"""
+        with self._lock:
+            self._pending[order_id] = signal
+            logger.info(
+                f"Pending 挂单: order_id={order_id}, K={signal.strike:.0f} "
+                f"{signal.direction} {signal.shares}份"
+            )
+
+    def confirm_fill(self, order_id: str) -> None:
+        """Pending 订单已成交，转为 filled 仓位"""
+        with self._lock:
+            signal = self._pending.pop(order_id, None)
+            if signal is None:
+                logger.warning(f"confirm_fill: order_id={order_id} 不在 pending 中")
+                return
+        # 调用 record_trade 更新 filled 仓位（需要在 lock 外调用以避免死锁）
+        self.record_trade(signal, "matched")
+
+    def cancel_pending(self, order_id: str) -> None:
+        """Pending 订单已取消，释放占用的仓位额度"""
+        with self._lock:
+            signal = self._pending.pop(order_id, None)
+            if signal is None:
+                logger.warning(f"cancel_pending: order_id={order_id} 不在 pending 中")
+                return
+            logger.info(
+                f"Pending 释放: order_id={order_id}, K={signal.strike:.0f} "
+                f"{signal.direction} {signal.shares}份"
+            )
 
     def record_trade(self, signal: Signal, status: str) -> None:
         """

@@ -15,11 +15,14 @@ venv/
 # 生成的数据和结果
 data/
 backtest_results/
+above_backtest_results/
+above_charts/
 strike_filter_results/
 timing_results/
 weekend_results/
 charts/
 touch_backtest_results/
+touch_backtest_results_*/
 
 # pip 安装产生的垃圾文件
 =*

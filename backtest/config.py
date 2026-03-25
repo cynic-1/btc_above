@@ -3,7 +3,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -77,6 +77,17 @@ class BacktestConfig:
     # 交易冷却期（分钟）: 同一 (date, strike) 两次交易间最少等待分钟数
     # 0 = 禁用（每分钟都可交易），30 = 每 30 分钟最多交易一次
     cooldown_minutes: int = 0
+
+    # 观测时间窗口过滤（分钟）
+    min_obs_minutes: int = 0          # 距事件最少分钟数 (0=不限)
+    max_obs_minutes: int = 99999      # 距事件最多分钟数 (99999=不限)
+
+    # 非对称阈值: YES/NO 方向使用不同 edge 阈值
+    yes_threshold: Optional[float] = None   # None = 沿用 entry_threshold
+    no_threshold: Optional[float] = None    # None = 沿用 entry_threshold
+
+    # bid-ask 价差过滤
+    max_spread: Optional[float] = None      # None = 不限
 
     # 使用固定 strike（从 Polymarket 市场发现），而非动态 K 网格
     use_fixed_strikes: bool = True

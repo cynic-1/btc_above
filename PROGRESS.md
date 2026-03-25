@@ -350,7 +350,90 @@
     - **Polymarket spread 定价高效**: mid 方向对了 53-65% 但 PnL 为负，说明做市商精确定价了信息优势的价值
     - **策略启示**: 中途退出永远是错的；没有"快进快出"可能性；全部价值 = 持有到结算的预测准确率
 
+- **DVOL 定价模型探索 (above/ 模块)** — 尝试用 Deribit DVOL + GBM 解析公式替代 K线 HAR-RV + Student-t + MC 为每日 above 合约定价:
+  - `above/dvol_pricing.py` — `prob_above_k_gbm(s0, K, sigma, T, mu)` 解析公式 P(S_T>K)=Φ(d2)
+  - `above/models.py` — `AboveBacktestConfig`, `AboveObservation`, `AboveStrikeResult`
+  - `above/backtest_engine.py` — 日历日循环回测引擎，复用 `DeribitIVCache` + `KlineCache` + `HybridPriceLookup`
+  - `above/report_generator.py` — Brier/LogLoss/Murphy 分解/校准曲线/PnL 模拟报告
+  - `above/chart_engine.py` — 逐日逐 strike 概率+BTC价格双轴图
+  - `run_above_backtest.py` — CLI 入口（--start-date, --end-date, --iv-source 等）
+  - `run_above_charts.py` — DVOL 模型 vs Polymarket 1 分钟分辨率对比图表
+  - `tests/test_dvol_pricing.py` (17 tests) + `tests/test_above_backtest.py` (5 tests) — 全部 22 tests passing
+  - Bug fix: `download_polymarket_data()` 改为优先从 `btc_above_events.json` 加载（与 `BacktestEngine` 一致），解决历史合约通过 Gamma API 搜不到导致 2025 年数据缺失的问题
+  - **回测结果 (2025-11-01 ~ 2026-03-24, 143 天)**:
+    - Brier: 模型 0.0489 vs 市场 0.0480 → **模型输 1.9%**
+    - 交易 PnL: 3% edge +$3,223, 5% edge **-$7,022**, 8% edge **-$3,091**
+    - 对比 touch 模型: touch Brier 模型赢市场 5.6%, PnL +$318K
+  - **根因分析**:
+    - VRP 不是问题: 实测 k = median(RV/DVOL) = 0.9958 ≈ 1.0，DVOL 和已实现波动率水平一致
+    - **分布形状是根因**: BTC 1m 收益超额峰度=26.4, Student-t 拟合 df=1.99，远非正态。GBM 正态假设把过多概率分配给「中等幅度运动」，导致中间区间 P(S_T>K) 系统性高估 7-10pp（校准曲线验证: 预测 0.35 → 实际 0.25, 预测 0.45 → 实际 0.35）
+    - **产品结构差异**: above 是终端分布敏感的（分布形状直接决定定价精度），touch 是路径依赖的（厚尾帮助 touch 概率估计）。这解释了同一个 DVOL 输入在两种合约上的表现差异
+  - **结论**: 对 daily above 合约，DVOL + GBM 解析公式不优于 K线 + Student-t + MC。DVOL 在波动率水平上无信息增量（k≈1.0），而 GBM 正态假设丢失了分布形状信息。DVOL 的潜在价值是作为 regime indicator（DVOL/RV 比值）而非替代 RV
+
+- **回测观测缓存 + 回放模式** — 分离定价计算与交易决策，支持一次计算多次回放:
+  - `backtest/observation_cache.py` — `save_observations()` / `load_observations()` 序列化 BacktestResult 到 pkl（含 observations + event_outcomes，版本检查）
+  - `run_backtest.py` — 新增 `--save-obs` 保存观测缓存、`--replay <path>` 回放模式（跳过全部定价计算，仅用新交易参数运行报告生成）
+  - 提取 `_print_summary()` 辅助函数消除打印代码重复
+  - `tests/test_observation_cache.py` — 7 项测试全部通过（往返序列化、版本检查、bid_ask 元组保留等）
+  - **用法**: 完整回测加 `--save-obs`，后续改 threshold/direction/cooldown 时 `--replay` 秒级完成
+
+- **回测策略诊断 & 参数扫描** — 对 2025-11-01 ~ 2026-03-24 完整回测结果（Brier=0.038, PF=1.050）进行深度分析:
+  - **核心问题诊断**: 模型 Brier Score 优于市场（0.038 vs 0.040），但利润极薄（PF=1.050, MaxDD=250%）
+    1. **Adverse selection**: 在实际交易的观测点，模型 Brier=0.144 反而差于市场 0.135；模型优势全部集中在不可交易的深度 ITM/OTM 区域
+    2. **系统性过度自信**: 模型在 0.3-0.85 概率区间系统性高估 p_P（如预测 0.65 实际只有 0.50），导致 BUY YES 方向亏损（每份 -$0.036）
+    3. **手续费吞噬利润**: 费前 PnL $262K vs 手续费 $543K，费后亏损 $282K；24 万笔交易的手续费远超利润
+    4. **低信号交易拖累**: Q1+Q2（最弱信号）亏损 $1.3M，仅 Q3+ 赚钱
+  - **参数扫描结果** (使用 --replay 秒级完成):
+    | 方向 | Threshold | Cooldown | 交易笔数 | PnL | PF | MaxDD |
+    |---|---|---|---:|---:|---:|---:|
+    | both | 0.05 | 0 | 239,721 | $261,920 | 1.050 | 250% |
+    | both | 0.10 | 0 | 20,419 | $1,760 | 1.004 | 36% |
+    | no_only | 0.05 | 0 | 15,831 | $242,685 | 1.726 | 14% |
+    | no_only | 0.08 | 0 | 11,621 | $194,813 | 1.745 | 12% |
+    | no_only | 0.10 | 0 | 9,389 | $142,837 | 1.611 | 12% |
+    | no_only | 0.15 | 0 | 5,047 | $88,854 | 1.651 | 12% |
+    | no_only | 0.20 | 0 | 2,404 | $47,833 | 1.743 | 11% |
+    | no_only | 0.08 | 30 | 3,524 | $48,078 | 1.594 | 8% |
+    | no_only | 0.08 | 60 | 1,975 | $28,299 | 1.629 | 5% |
+  - **方向性偏差验证**: BTC 从 $110K 跌至 $70K（-36%），需区分 alpha vs beta
+    - "无脑买 NO"（bid>0.50 即买）也赚 $89K，证实存在方向性偏差
+    - 模型 NO 赚 $195K，**增量 alpha = $106K (54%)**
+    - 上涨月（12月↑3.6%, 3月↑6.1%）: 无脑 NO 亏钱或打平，模型 NO 仍然为正
+    - **结论**: 模型增量 alpha 真实存在，但策略整体有强方向性偏差，在持续牛市中可能失效
+  - **待解决的根因**: 模型 0.3-0.85 概率区间的系统性高估——可能来自 HAR-RV 高估、VRP 参数偏差、或 Student-t 分布形态问题
+  - **仓位限制对比分析** (no_only, threshold=0.05):
+    - 无限仓位: PnL $1.5M, PF 1.564, MaxDD 48%, 128K trades, 最大单市场亏损 $182K
+    - 10,000 share 限制: PnL $243K, PF 1.726, MaxDD 14%, 16K trades, 最大单市场亏损 $9.3K
+    - **限制版本的风险调整后收益更优**: Sharpe 5.26 vs 3.80, Sortino 8.03 vs 5.17
+    - **早期信号质量最高**: 限制版 Q1 每笔 $26.66（最高），无限版靠后期堆量但边际收益递减
+    - **Walk-forward 灾难窗口被驯化**: 无限版最差 -235% → 限制版 +4.48%；-214% → -2.47%
+    - **ITM 区域是无限仓位的毒药**: 无限版 ITM 亏 $1.15M (PF 0.454)，限制版仅亏 $66K (PF 0.764)
+  - **Moneyness 分层模拟** — 按交易时刻 S0 vs K 关系独立模拟各区间:
+    - OTM (S0<K×0.99): PnL $141K, PF 1.712, MaxDD 20%, 11K trades — 胜率高但每笔收益低
+    - ATM (0.99K≤S0≤1.01K): PnL $201K, PF 1.828, MaxDD 14%, 8K trades — **每笔收益最高 $25.30**
+    - ITM (S0>K×1.01): PnL $32K, PF 2.032, MaxDD 9%, 2K trades — 最高 PF 但交易量少
+    - **结论**: OTM-only 不如 ALL（MaxDD 反而更高 20% vs 14%），ATM 是真正的 edge 所在
+  - **Bug fix: §4.4 moneyness PnL 归因双重计数** — `compute_price_range_stats` 的 PnL 归因使用 per-group `counted_keys`，同一市场 (event_date, strike) 在 S0 变化后被计入多个 moneyness 组导致 PnL 重复统计。修复为全局 `counted_keys`，每个市场只归因一次（按首次观测时的 S0 分类）
+  - **报告 §5.3 改为按日期净值变化表** — 替换原来的按市场排序 PnL 表，改为时间序列视图：每行包含日期、BTC(T-24h)→结算价及涨跌%、交易市场及份额（如 `$70K N10000 ✓`）、日 PnL、累计权益。直观展示策略在每个事件日的仓位和盈亏
+
+- **系统性参数探索** — `simulate_portfolio` 新增 3 类过滤器 + 探索脚本 `explore_params.py`:
+  - **过滤器 A: 时间窗口** (`min_obs_minutes`, `max_obs_minutes`) — 限制交易观测时间范围
+  - **过滤器 B: 非对称阈值** (`yes_threshold`, `no_threshold`) — YES/NO 方向独立 edge 门槛
+  - **过滤器 C: Spread 过滤** (`max_spread`) — 排除宽 bid-ask 价差的市场
+  - 5 阶段网格搜索（仓位→时间→阈值→spread→组合），每组含前半/后半时间拆分过拟合检测
+  - **最优配置**: `Y=0.10, N=0.03, max_shares=2000, spread<=0.05`
+    - PF=1.671, MaxDD=4.4%, PnL=$57K, Sharpe=0.306, 8576 trades
+    - 前半 PF=1.576, 后半 PF=1.775 — 时间稳定性良好
+    - 相比基准 both t=0.03 max=10K: PF +33%, MaxDD -78%
+  - 与 no_only 对比:
+    | 配置 | PF | MaxDD | PnL | 震荡市 |
+    |---|---|---|---|---|
+    | no_only t=0.05 max=10K | 1.726 | 14.3% | $243K | 差 |
+    | 最优 both max=2000 | 1.671 | 4.4% | $57K | 好 |
+    | 最优 both max=5000 | 1.561 | 8.3% | $120K | 好 |
+
 ## Next Steps (Phase B+)
+- **修复校准偏差** — 定位 0.3-0.85 概率区间高估的根因（HAR-RV / VRP k / Student-t 尾部），使 BUY YES 方向也能盈利
 - Deribit smile shape integration (SVI fitting, variance scaling)
 - VRP calibration (rolling k estimation, regime classification)
 - Last-minute microstructure (jump model, tick rounding)

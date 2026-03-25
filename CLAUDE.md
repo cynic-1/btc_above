@@ -74,6 +74,18 @@ All internal timestamps use **UTC milliseconds**. ET→UTC must handle DST corre
 
 Every pricing run must log: `now_utc`, `event_utc`, minutes-to-expiry, input snapshot (S0, RV_hat, seasonality multiplier, k, basis params, dist params), output (p_P per K, confidence interval, p_trade, edge, position size), and execution details when live.
 
+## 资源限制（必须遵守）
+
+本机内存和 CPU 有限，代码必须控制资源占用，避免 OOM 或卡死：
+
+- **禁止一次性加载全部数据到内存**。K线、订单簿、交易数据等必须按月/按天分批加载、处理完即释放
+- **禁止在内存中累积大量中间结果**。回测观测数据按月序列化到磁盘（pkl），不要跨月保留在内存
+- **Polygon 链上数据下载**必须使用分段扫描（segment-based），每段完成后写入磁盘。禁止全部收集到内存再写入
+- **并发下载控制**：Polygon RPC workers ≤ 3，Binance/Deribit API 遵守 token bucket 限速
+- **numpy 数组**：避免对整月 1m K线（~44000 行）做不必要的全量复制。用 slice 视图替代 copy
+- **回测主循环**：逐月运行，每月结束后生成报告并释放该月数据，再进入下月
+- **图表生成**：每张图生成后 `plt.close()` 释放内存，不要累积 Figure 对象
+
 ## Conventions
 
 Follow the patterns established in `/home/ubuntu/pm_arb`:

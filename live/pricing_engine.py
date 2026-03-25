@@ -16,7 +16,7 @@ import pytz
 from pricing_core.binance_data import Kline
 from pricing_core.distribution import fit_student_t
 from pricing_core.models import BasisParams, DistParams, HARCoefficients
-from pricing_core.pricing import simulate_ST, prob_above_K
+from pricing_core.pricing import prob_above_K_analytical_batch
 from pricing_core.time_utils import et_noon_to_utc_ms, minutes_until_event
 from pricing_core.vol_forecast import (
     compute_hourly_rv_profile,
@@ -145,12 +145,10 @@ class LivePricingEngine:
                 f"scale={self._cached_dist_params.scale:.6f}"
             )
 
-        # 8. MC 定价
-        ST = simulate_ST(
-            s0, rv_hat_final, self._cached_dist_params, basis_params,
-            n=self._config.mc_samples,
+        # 8. Student-t 解析定价
+        probs = prob_above_K_analytical_batch(
+            s0, k_list, rv_hat_final, self._cached_dist_params,
         )
-        probs = prob_above_K(ST, k_list)
 
         result = dict(zip(k_list, probs))
 

@@ -234,6 +234,11 @@ def generate_report(
         entry_threshold=config.entry_threshold,
         direction_filter=config.direction_filter,
         cooldown_minutes=config.cooldown_minutes,
+        min_obs_minutes=config.min_obs_minutes,
+        max_obs_minutes=config.max_obs_minutes,
+        yes_threshold=config.yes_threshold,
+        no_threshold=config.no_threshold,
+        max_spread=config.max_spread,
     )
     # 校准分析
     cal_result = run_calibration_analysis(
@@ -262,6 +267,13 @@ def generate_report(
         shares_per_trade=config.shares_per_trade,
         max_net_shares=config.max_net_shares,
         entry_threshold=config.entry_threshold,
+        direction_filter=config.direction_filter,
+        cooldown_minutes=config.cooldown_minutes,
+        min_obs_minutes=config.min_obs_minutes,
+        max_obs_minutes=config.max_obs_minutes,
+        yes_threshold=config.yes_threshold,
+        no_threshold=config.no_threshold,
+        max_spread=config.max_spread,
     )
     if wf_result.windows:
         metrics["overall"]["walk_forward"] = {

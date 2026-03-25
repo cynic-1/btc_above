@@ -442,23 +442,71 @@ def generate_strategy_report(
             lines.append(f"| {q} |  |  |  |  |  |")
     lines.append("")
 
-    # 按市场
-    lines.append("### 按市场")
-    lines.append("| 市场 | PnL | 交易数 | MaxDD | 备注 |")
-    lines.append("|---|---:|---:|---:|---|")
+    # 按日期净值变化（时间序列）
+    lines.append("### 按日期净值变化")
+    lines.append("| 日期 | BTC(T-24h) | BTC结算 | 涨跌 | 交易市场 | 日PnL | 累计权益 |")
+    lines.append("|---|---:|---:|---:|---|---:|---:|")
     if markets:
-        sorted_markets = sorted(markets, key=lambda m: m["pnl"], reverse=True)
-        for m in sorted_markets:
-            n_t = len(m.get("trades", []))
+        # 构建每日 S0 和结算价
+        s0_by_date = {}
+        settle_by_date = {}
+        for obs in result.observations:
+            if obs.event_date not in s0_by_date:
+                s0_by_date[obs.event_date] = obs.s0
+        for ev in result.event_outcomes:
+            settle_by_date[ev.event_date] = ev.settlement_price
+
+        # 按日期聚合市场信息
+        from collections import defaultdict
+        daily_markets = defaultdict(list)
+        for m in markets:
+            daily_markets[m["event_date"]].append(m)
+
+        event_pnls = portfolio.get("event_pnls", [])
+        initial_capital = portfolio.get("initial_capital", 100000.0)
+
+        # 按日期计算累计权益
+        cumulative_eq = initial_capital
+        for ep in sorted(event_pnls, key=lambda x: x["event_date"]):
+            event_date = ep["event_date"]
+            day_pnl = ep["pnl"]
+            cumulative_eq += day_pnl
+
+            day_markets = daily_markets.get(event_date, [])
+            if not day_markets and abs(day_pnl) < 0.01:
+                continue  # 跳过无交易日
+
+            s0 = s0_by_date.get(event_date, 0)
+            settle = settle_by_date.get(event_date, 0)
+            chg_pct = (settle - s0) / s0 * 100 if s0 > 0 else 0
+
+            # 市场摘要: 每个 strike 的方向和份额
+            mkt_parts = []
+            for m in sorted(day_markets, key=lambda x: x["strike"]):
+                k = m["strike"]
+                direction = m.get("settlement", "")
+                sym = "✓" if (direction == "NO" and m.get("no_shares", 0) > 0) or \
+                             (direction == "YES" and m.get("yes_shares", 0) > 0) else "✗"
+                if m.get("no_shares", 0) > 0 and m.get("yes_shares", 0) > 0:
+                    pos_str = f"Y{m['yes_shares']}+N{m['no_shares']}"
+                elif m.get("no_shares", 0) > 0:
+                    pos_str = f"N{m['no_shares']}"
+                else:
+                    pos_str = f"Y{m['yes_shares']}"
+                mkt_parts.append(f"${k/1000:.0f}K {pos_str} {sym}")
+            mkt_str = ", ".join(mkt_parts) if mkt_parts else "-"
+
             lines.append(
-                f"| {m['title']} "
-                f"| {f_money(m['pnl'])} "
-                f"| {n_t} "
-                f"|  "
-                f"| {m['settlement']} |"
+                f"| {event_date} "
+                f"| ${s0:,.0f} "
+                f"| ${settle:,.0f} "
+                f"| {chg_pct:+.1f}% "
+                f"| {mkt_str} "
+                f"| {f_money(day_pnl)} "
+                f"| {f_money(cumulative_eq)} |"
             )
     else:
-        lines.append("|  |  |  |  |  |")
+        lines.append("|  |  |  |  |  |  |  |")
     lines.append("")
 
     # 集中度

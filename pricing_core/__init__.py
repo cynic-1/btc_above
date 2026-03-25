@@ -27,7 +27,10 @@ from .vol_forecast import (
     intraday_seasonality_factor,
 )
 from .distribution import fit_student_t, sample_return, build_empirical_cdf
-from .pricing import simulate_ST, prob_above_K, confidence_interval, price_strikes
+from .pricing import (
+    simulate_ST, prob_above_K, confidence_interval, price_strikes,
+    prob_above_K_analytical, prob_above_K_analytical_batch,
+)
 from .execution import (
     compute_opinion_fee,
     shrink_probability,

@@ -14,6 +14,7 @@ import pytest
 from backtest.orderbook_reader import (
     OrderbookPriceLookup,
     OrderbookQuote,
+    PriceFilterStats,
     load_markets_from_events_json,
 )
 from backtest.polymarket_discovery import PolymarketMarketInfo
@@ -239,3 +240,263 @@ class TestLoadMarketsFromEventsJson:
         assert info.condition_id == "0xaabbccdd11223344"
         assert info.yes_token_id == "token_yes_1"
         assert info.event_date == "2026-02-21"
+
+
+# ── 数据质量过滤测试 ──────────────────────────────────────
+
+
+def _make_lookup(tmpdir, cid, timestamps, bids, asks, **kwargs):
+    """辅助: 创建带合成数据的 OrderbookPriceLookup"""
+    np.savez_compressed(
+        os.path.join(tmpdir, f"{cid[:16]}.npz"),
+        timestamps_ms=np.array(timestamps, dtype=np.int64),
+        best_bids=np.array(bids, dtype=np.float64),
+        best_asks=np.array(asks, dtype=np.float64),
+    )
+    lookup = OrderbookPriceLookup(cache_dir=tmpdir, **kwargs)
+    lookup.preload([cid])
+    return lookup
+
+
+class TestStaleFilter:
+    """过期数据过滤"""
+
+    CID = "0xstaletest000000"
+
+    def test_stale_returns_none(self):
+        """快照过期 → None"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.50], asks=[0.52],
+                max_stale_ms=2000,
+            )
+            # 查询 ts=5000, 快照 ts=1000, age=4000 > 2000
+            assert lookup.get_price_at(self.CID, 5000) is None
+            assert lookup.filter_stats.filtered_stale == 1
+
+    def test_fresh_returns_mid(self):
+        """快照未过期 → mid-price"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.50], asks=[0.52],
+                max_stale_ms=2000,
+            )
+            price = lookup.get_price_at(self.CID, 2000)
+            assert price is not None
+            assert abs(price - 0.51) < 1e-10
+
+    def test_stale_exact_boundary(self):
+        """age == max_stale_ms → 还算有效（用 > 而非 >=）"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.50], asks=[0.52],
+                max_stale_ms=2000,
+            )
+            price = lookup.get_price_at(self.CID, 3000)
+            assert price is not None
+
+    def test_stale_disabled(self):
+        """max_stale_ms=0 → 不检查过期"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.50], asks=[0.52],
+                max_stale_ms=0,
+            )
+            price = lookup.get_price_at(self.CID, 999_999_999)
+            assert price is not None
+            assert lookup.filter_stats.filtered_stale == 0
+
+
+class TestSpreadFilter:
+    """宽幅价差过滤"""
+
+    CID = "0xspreadtest00000"
+
+    def test_wide_spread_returns_none(self):
+        """spread > max_spread → None"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.20], asks=[0.51],
+                max_spread=0.15, max_stale_ms=0,
+            )
+            assert lookup.get_price_at(self.CID, 1000) is None
+            assert lookup.filter_stats.filtered_wide_spread == 1
+
+    def test_narrow_spread_returns_mid(self):
+        """spread ≤ max_spread → mid-price"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.40], asks=[0.50],
+                max_spread=0.15, max_stale_ms=0,
+            )
+            price = lookup.get_price_at(self.CID, 1000)
+            assert price is not None
+            assert abs(price - 0.45) < 1e-10
+
+    def test_spread_just_under(self):
+        """spread 刚好低于阈值 → 有效"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.40], asks=[0.54],
+                max_spread=0.15, max_stale_ms=0,
+            )
+            price = lookup.get_price_at(self.CID, 1000)
+            assert price is not None
+
+    def test_spread_disabled(self):
+        """max_spread=0 → 不检查价差"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.10], asks=[0.90],
+                max_spread=0, max_stale_ms=0,
+            )
+            price = lookup.get_price_at(self.CID, 1000)
+            assert price is not None
+
+
+class TestZeroSideFilter:
+    """零边报价过滤"""
+
+    CID = "0xzerosidetest000"
+
+    def test_reject_bid_zero(self):
+        """reject 策略: bid=0 → None"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.0], asks=[0.02],
+                zero_side_policy="reject", max_stale_ms=0,
+            )
+            assert lookup.get_price_at(self.CID, 1000) is None
+            assert lookup.filter_stats.filtered_zero_side == 1
+
+    def test_reject_ask_zero(self):
+        """reject 策略: ask=0 → None"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.50], asks=[0.0],
+                zero_side_policy="reject", max_stale_ms=0,
+            )
+            assert lookup.get_price_at(self.CID, 1000) is None
+
+    def test_accept_settled_high_bid(self):
+        """accept_settled 策略: bid=0.999, ask=0 → 返回 0.999"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.999], asks=[0.0],
+                zero_side_policy="accept_settled", max_stale_ms=0,
+            )
+            price = lookup.get_price_at(self.CID, 1000)
+            assert price is not None
+            assert abs(price - 0.999) < 1e-10
+
+    def test_accept_settled_low_ask(self):
+        """accept_settled 策略: bid=0, ask=0.02 → None（未结算）"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.0], asks=[0.02],
+                zero_side_policy="accept_settled", max_stale_ms=0,
+            )
+            assert lookup.get_price_at(self.CID, 1000) is None
+
+    def test_legacy_bid_zero_returns_ask(self):
+        """legacy 策略: bid=0 → 返回 ask"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.0], asks=[0.02],
+                zero_side_policy="legacy", max_stale_ms=0,
+            )
+            price = lookup.get_price_at(self.CID, 1000)
+            assert price is not None
+            assert abs(price - 0.02) < 1e-10
+
+    def test_legacy_ask_zero_returns_bid(self):
+        """legacy 策略: ask=0 → 返回 bid"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.50], asks=[0.0],
+                zero_side_policy="legacy", max_stale_ms=0,
+            )
+            price = lookup.get_price_at(self.CID, 1000)
+            assert price is not None
+            assert abs(price - 0.50) < 1e-10
+
+
+class TestFilterStats:
+    """过滤统计计数"""
+
+    CID = "0xfilterstats0000"
+
+    def test_stats_counting(self):
+        """各过滤路径计数正确"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000, 2000, 3000, 4000],
+                bids=[0.50, 0.0, 0.10, 0.40],
+                asks=[0.52, 0.02, 0.90, 0.42],
+                max_stale_ms=500, max_spread=0.15,
+                zero_side_policy="reject",
+            )
+
+            # ts=1000: 正常快照
+            lookup.get_price_at(self.CID, 1000)
+            # ts=2500: 最近是 ts=2000 (age=500, 刚好), bid=0 → reject
+            lookup.get_price_at(self.CID, 2500)
+            # ts=3000: 正常时间, spread=0.80 → wide
+            lookup.get_price_at(self.CID, 3000)
+            # ts=9000: 最近是 ts=4000, age=5000 > 500 → stale
+            lookup.get_price_at(self.CID, 9000)
+            # 未知 cid
+            lookup.get_price_at("0xunknown", 1000)
+
+            s = lookup.filter_stats
+            assert s.total_queries == 5
+            assert s.returned == 1
+            assert s.filtered_zero_side == 1
+            assert s.filtered_wide_spread == 1
+            assert s.filtered_stale == 1
+            assert s.no_data == 1
+
+    def test_reset_stats(self):
+        """reset_stats 清空计数"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lookup = _make_lookup(
+                tmpdir, self.CID,
+                timestamps=[1000],
+                bids=[0.50], asks=[0.52],
+                max_stale_ms=0,
+            )
+            lookup.get_price_at(self.CID, 1000)
+            assert lookup.filter_stats.total_queries == 1
+
+            lookup.reset_stats()
+            assert lookup.filter_stats.total_queries == 0
+            assert lookup.filter_stats.returned == 0

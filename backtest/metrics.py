@@ -167,6 +167,11 @@ def simulate_portfolio(
     entry_threshold: float = 0.03,
     direction_filter: str = "both",
     cooldown_minutes: int = 0,
+    min_obs_minutes: int = 0,
+    max_obs_minutes: int = 99999,
+    yes_threshold: float | None = None,
+    no_threshold: float | None = None,
+    max_spread: float | None = None,
 ) -> Dict:
     """
     固定份额组合模拟
@@ -183,6 +188,8 @@ def simulate_portfolio(
 
     allow_yes = direction_filter != "no_only"
     allow_no = direction_filter != "yes_only"
+    eff_yes_threshold = yes_threshold if yes_threshold is not None else entry_threshold
+    eff_no_threshold = no_threshold if no_threshold is not None else entry_threshold
 
     equity_curve = [initial_capital]
     event_pnls: List[Dict] = []
@@ -210,6 +217,9 @@ def simulate_portfolio(
         last_trade_minutes: Dict[float, int] = {}
 
         for obs in date_obs:
+            # 过滤器 A: 时间窗口
+            if obs.obs_minutes < min_obs_minutes or obs.obs_minutes > max_obs_minutes:
+                continue
             for k in obs.k_grid:
                 p_model = obs.predictions.get(k)
                 market_price = obs.market_prices.get(k)
@@ -230,6 +240,9 @@ def simulate_portfolio(
                     bid, ask = ba[0], ba[1]
                 else:
                     continue  # 无真实 bid/ask 或零价差时跳过
+                # 过滤器 C: bid-ask 价差上限
+                if max_spread is not None and (ask - bid) > max_spread:
+                    continue
 
                 if k not in positions:
                     positions[k] = {
@@ -244,7 +257,7 @@ def simulate_portfolio(
 
                 # BUY YES: 以 ask 价买入, edge = p_model - ask
                 edge_yes = p_model - ask
-                if allow_yes and edge_yes > entry_threshold and ask < 0.99:
+                if allow_yes and edge_yes > eff_yes_threshold and ask < 0.99:
                     if net + shares_per_trade <= max_net_shares:
                         cost = shares_per_trade * ask
                         pos["yes_shares"] += shares_per_trade
@@ -261,7 +274,7 @@ def simulate_portfolio(
                         last_trade_minutes[k] = obs.obs_minutes
 
                 # BUY NO: 以 (1-bid) 价买入, edge = bid - p_model
-                elif allow_no and bid - p_model > entry_threshold and bid > 0.01:
+                elif allow_no and bid - p_model > eff_no_threshold and bid > 0.01:
                     net_no = pos["no_shares"] - pos["yes_shares"]
                     if net_no + shares_per_trade <= max_net_shares:
                         cost = shares_per_trade * (1.0 - bid)
@@ -646,6 +659,7 @@ def run_adversarial_tests(
     full_portfolio: Optional[Dict] = None,
     direction_filter: str = "both",
     cooldown_minutes: int = 0,
+    **kwargs,
 ) -> Dict[str, Dict]:
     """
     三种对抗测试：过滤部分观测后重跑 simulate_portfolio
@@ -668,6 +682,7 @@ def run_adversarial_tests(
         entry_threshold=entry_threshold,
         direction_filter=direction_filter,
         cooldown_minutes=cooldown_minutes,
+        **kwargs,
     )
 
     def _summarize(portfolio: Dict) -> Dict:
@@ -786,29 +801,33 @@ def compute_price_range_stats(observations: list, portfolio: dict) -> List[Dict]
     for m in portfolio.get("markets", []):
         market_pnl[(m["event_date"], m["strike"])] = m["pnl"]
 
-    # 每组按 obs 中 (event_date, strike) 归因 PnL
+    # 每个市场归因到唯一的 moneyness 组（首次观测时的 S0 决定分类）
+    # 注意: 同一个 strike 在 24h 内 S0 会变化，可能跨越 OTM→ATM→ITM。
+    # 旧实现用 per-group counted_keys 导致同一市场 PnL 被重复计入多个组。
+    # 修复: 用全局 counted_keys，每个市场只归因一次（按首次观测分类）。
     group_pnl: Dict[str, float] = {"ITM": 0.0, "ATM": 0.0, "OTM": 0.0}
     group_profit: Dict[str, float] = {"ITM": 0.0, "ATM": 0.0, "OTM": 0.0}
     group_loss: Dict[str, float] = {"ITM": 0.0, "ATM": 0.0, "OTM": 0.0}
-    counted_keys: Dict[str, set] = {"ITM": set(), "ATM": set(), "OTM": set()}
+    counted_keys: set = set()
 
     for obs in observations:
         for k in obs.k_grid:
+            key = (obs.event_date, k)
+            if key in counted_keys:
+                continue
+            counted_keys.add(key)
             if obs.s0 > k * 1.01:
                 g = "ITM"
             elif obs.s0 < k * 0.99:
                 g = "OTM"
             else:
                 g = "ATM"
-            key = (obs.event_date, k)
-            if key not in counted_keys[g]:
-                counted_keys[g].add(key)
-                pnl = market_pnl.get(key, 0.0)
-                group_pnl[g] += pnl
-                if pnl > 0:
-                    group_profit[g] += pnl
-                elif pnl < 0:
-                    group_loss[g] += abs(pnl)
+            pnl = market_pnl.get(key, 0.0)
+            group_pnl[g] += pnl
+            if pnl > 0:
+                group_profit[g] += pnl
+            elif pnl < 0:
+                group_loss[g] += abs(pnl)
 
     results = []
     for name in ["ITM", "ATM", "OTM"]:
@@ -934,6 +953,7 @@ def run_cost_sensitivity(
     entry_threshold: float = 0.03,
     direction_filter: str = "both",
     cooldown_minutes: int = 0,
+    **kwargs,
 ) -> List[Dict]:
     """
     不同 fee 乘数下的组合表现
@@ -953,6 +973,7 @@ def run_cost_sensitivity(
         entry_threshold=entry_threshold,
         direction_filter=direction_filter,
         cooldown_minutes=cooldown_minutes,
+        **kwargs,
     )
 
     results = []
@@ -999,6 +1020,7 @@ def run_latency_sensitivity(
     entry_threshold: float = 0.03,
     direction_filter: str = "both",
     cooldown_minutes: int = 0,
+    **kwargs,
 ) -> List[Dict]:
     """
     按 obs_minutes 分组评估不同观测延迟的信号质量
@@ -1048,6 +1070,7 @@ def run_latency_sensitivity(
             entry_threshold=entry_threshold,
             direction_filter=direction_filter,
             cooldown_minutes=cooldown_minutes,
+            **kwargs,
         )
 
         results.append({
@@ -1073,6 +1096,7 @@ def run_capacity_analysis(
     entry_threshold: float = 0.03,
     direction_filter: str = "both",
     cooldown_minutes: int = 0,
+    **kwargs,
 ) -> List[Dict]:
     """
     不同 shares_per_trade 规模下的组合表现
@@ -1082,6 +1106,7 @@ def run_capacity_analysis(
     Returns:
         [{shares_per_trade, pnl, return_pct, max_dd_pct, profit_factor}, ...]
     """
+    extra = {k: v for k, v in kwargs.items() if k != "shares_per_trade"}
     results = []
     for spt in [100, 200, 500, 1000]:
         port = simulate_portfolio(
@@ -1092,6 +1117,7 @@ def run_capacity_analysis(
             entry_threshold=entry_threshold,
             direction_filter=direction_filter,
             cooldown_minutes=cooldown_minutes,
+            **extra,
         )
         results.append({
             "shares_per_trade": spt,
@@ -1317,6 +1343,11 @@ def compute_all_metrics(
     entry_threshold: float = 0.03,
     direction_filter: str = "both",
     cooldown_minutes: int = 0,
+    min_obs_minutes: int = 0,
+    max_obs_minutes: int = 99999,
+    yes_threshold: float | None = None,
+    no_threshold: float | None = None,
+    max_spread: float | None = None,
 ) -> Dict:
     """
     汇总所有评估指标，按时间段分组
@@ -1417,16 +1448,21 @@ def compute_all_metrics(
         if bucket_result:
             result["by_time_bucket"][bucket] = bucket_result
 
-    # 组合模拟
-    portfolio = simulate_portfolio(
-        observations,
+    # 组合模拟参数（透传给所有下游调用）
+    sim_kwargs = dict(
         initial_capital=initial_capital,
         shares_per_trade=shares_per_trade,
         max_net_shares=max_net_shares,
         entry_threshold=entry_threshold,
         direction_filter=direction_filter,
         cooldown_minutes=cooldown_minutes,
+        min_obs_minutes=min_obs_minutes,
+        max_obs_minutes=max_obs_minutes,
+        yes_threshold=yes_threshold,
+        no_threshold=no_threshold,
+        max_spread=max_spread,
     )
+    portfolio = simulate_portfolio(observations, **sim_kwargs)
     result["overall"]["portfolio"] = portfolio
 
     # --- 风险指标 ---
@@ -1437,14 +1473,7 @@ def compute_all_metrics(
 
     # --- 对抗测试 ---
     result["overall"]["adversarial"] = run_adversarial_tests(
-        observations,
-        initial_capital=initial_capital,
-        shares_per_trade=shares_per_trade,
-        max_net_shares=max_net_shares,
-        entry_threshold=entry_threshold,
-        full_portfolio=portfolio,
-        direction_filter=direction_filter,
-        cooldown_minutes=cooldown_minutes,
+        observations, full_portfolio=portfolio, **sim_kwargs,
     )
 
     # --- 交易时点条件分析 (§4.6) ---
@@ -1464,34 +1493,17 @@ def compute_all_metrics(
 
     # --- 手续费敏感性 (§7.3) ---
     result["overall"]["cost_sensitivity"] = run_cost_sensitivity(
-        observations,
-        initial_capital=initial_capital,
-        shares_per_trade=shares_per_trade,
-        max_net_shares=max_net_shares,
-        entry_threshold=entry_threshold,
-        direction_filter=direction_filter,
-        cooldown_minutes=cooldown_minutes,
+        observations, **sim_kwargs,
     )
 
     # --- 延迟敏感性 (§7.2) ---
     result["overall"]["latency_sensitivity"] = run_latency_sensitivity(
-        observations,
-        initial_capital=initial_capital,
-        shares_per_trade=shares_per_trade,
-        max_net_shares=max_net_shares,
-        entry_threshold=entry_threshold,
-        direction_filter=direction_filter,
-        cooldown_minutes=cooldown_minutes,
+        observations, **sim_kwargs,
     )
 
     # --- 容量扩展 (§8.3) ---
     result["overall"]["capacity_analysis"] = run_capacity_analysis(
-        observations,
-        initial_capital=initial_capital,
-        max_net_shares=max_net_shares,
-        entry_threshold=entry_threshold,
-        direction_filter=direction_filter,
-        cooldown_minutes=cooldown_minutes,
+        observations, **sim_kwargs,
     )
 
     return result
