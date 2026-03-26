@@ -435,22 +435,29 @@ class LiveTradingEngine:
                     f"shares={signal.shares} status={status}, 不计入仓位"
                 )
         else:
-            # GTC: 立即成交则记录 filled，否则加入 pending 等待超时取消
-            if status == "matched":
+            # GTC: 立即计入仓位（保守过高计数，防止超限）
+            # 超时后取消成功才减去仓位
+            if status != "failed":
                 self._position_manager.record_trade(signal, status)
-            elif status != "failed":
-                self._position_manager.add_pending(signal, order_id)
-                self._pending_orders[order_id] = {
-                    "signal": signal,
-                    "placed_at": time.time(),
-                }
+                if status != "matched":
+                    # 挂单中，追踪以便超时取消
+                    self._pending_orders[order_id] = {
+                        "signal": signal,
+                        "placed_at": time.time(),
+                    }
 
         self._last_order_time[signal.condition_id] = time.time()
 
         logger.info(f"下单结果: order_id={order_id}, status={status}")
 
     def _check_pending_orders(self) -> None:
-        """检查超时的 GTC 挂单，取消并释放仓位"""
+        """检查超时的 GTC 挂单，取消未成交的并回退仓位
+
+        策略：下单时已 record_trade（保守计入仓位）。
+        超时后尝试取消：
+        - 取消成功 → 订单确实未成交 → reverse_trade 回退仓位
+        - 取消失败 → 订单已成交 → 仓位已正确，无需操作
+        """
         if not self._pending_orders:
             return
 
@@ -465,21 +472,24 @@ class LiveTradingEngine:
             signal = info["signal"]
             age = now - info["placed_at"]
 
-            # 尝试取消
-            result = self._order_client.cancel_order(order_id)
+            try:
+                result = self._order_client.cancel_order(order_id)
+                cancelled = isinstance(result, dict) and "error" not in result
+            except Exception as e:
+                logger.warning(f"取消订单异常: order_id={order_id}, {e}")
+                cancelled = False
 
-            if isinstance(result, dict) and "error" not in result:
-                # 取消成功 → 未成交，释放 pending 仓位
-                self._position_manager.cancel_pending(order_id)
+            if cancelled:
+                # 取消成功 → 订单未成交，回退已计入的仓位
+                self._position_manager.reverse_trade(signal)
                 logger.info(
-                    f"挂单超时取消: order_id={order_id} K={signal.strike:.0f} "
+                    f"挂单超时取消+回退仓位: order_id={order_id} K={signal.strike:.0f} "
                     f"{signal.direction} {signal.shares}份, 挂了{age:.0f}s"
                 )
             else:
-                # 取消失败（可能已成交）→ 转为 filled
-                self._position_manager.confirm_fill(order_id)
+                # 取消失败 → 已成交，仓位已正确记录
                 logger.info(
-                    f"挂单已成交: order_id={order_id} K={signal.strike:.0f} "
+                    f"挂单已成交（取消失败）: order_id={order_id} K={signal.strike:.0f} "
                     f"{signal.direction} {signal.shares}份"
                 )
 
