@@ -179,3 +179,12 @@ class PolymarketOrderClient:
         except Exception as e:
             logger.error(f"获取挂单失败: {e}")
             return []
+
+    def get_order(self, order_id: str) -> dict:
+        """查询单个订单状态 (live/matched/cancelled)"""
+        try:
+            result = self._client.get_order(order_id)
+            return result if isinstance(result, dict) else {"raw": str(result)}
+        except Exception as e:
+            logger.error(f"查询订单失败: order_id={order_id}, error={e}")
+            return {"error": str(e)}

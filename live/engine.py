@@ -451,49 +451,77 @@ class LiveTradingEngine:
         logger.info(f"下单结果: order_id={order_id}, status={status}")
 
     def _check_pending_orders(self) -> None:
-        """检查超时的 GTC 挂单，取消未成交的并回退仓位
+        """通过 open orders 轮询对账 pending 订单
 
         策略：下单时已 record_trade（保守计入仓位）。
-        超时后尝试取消：
-        - 取消成功 → 订单确实未成交 → reverse_trade 回退仓位
-        - 取消失败 → 订单已成交 → 仓位已正确，无需操作
+        每个周期用 get_open_orders() 作为真相源：
+
+        1. pending 不在 open set → 已成交 → 仓位已正确，移除 pending
+        2. pending 在 open set + 超时 → cancel → get_order 二次确认
+           → matched: 不回退; 其他: reverse_trade 回退
+        3. pending 在 open set + 未超时 → 继续等待
         """
         if not self._pending_orders:
             return
 
+        try:
+            open_orders = self._order_client.get_open_orders()
+        except Exception as e:
+            logger.warning(f"获取 open orders 失败，跳过本轮对账: {e}")
+            return
+
+        open_ids = {o.get("id", "") for o in open_orders if isinstance(o, dict)}
+
         timeout = self._config.order_timeout_seconds
         now = time.time()
-        expired = [
-            (oid, info) for oid, info in self._pending_orders.items()
-            if now - info["placed_at"] >= timeout
-        ]
+        to_remove = []
 
-        for order_id, info in expired:
+        for order_id, info in self._pending_orders.items():
             signal = info["signal"]
             age = now - info["placed_at"]
 
-            try:
-                result = self._order_client.cancel_order(order_id)
-                cancelled = isinstance(result, dict) and "error" not in result
-            except Exception as e:
-                logger.warning(f"取消订单异常: order_id={order_id}, {e}")
-                cancelled = False
-
-            if cancelled:
-                # 取消成功 → 订单未成交，回退已计入的仓位
-                self._position_manager.reverse_trade(signal)
+            if order_id not in open_ids:
+                # 不在 open set → 已成交，仓位已正确记录
                 logger.info(
-                    f"挂单超时取消+回退仓位: order_id={order_id} K={signal.strike:.0f} "
-                    f"{signal.direction} {signal.shares}份, 挂了{age:.0f}s"
+                    f"挂单已成交: order_id={order_id} K={signal.strike:.0f} "
+                    f"{signal.direction} {signal.shares}份, {age:.0f}s"
                 )
-            else:
-                # 取消失败 → 已成交，仓位已正确记录
-                logger.info(
-                    f"挂单已成交（取消失败）: order_id={order_id} K={signal.strike:.0f} "
-                    f"{signal.direction} {signal.shares}份"
-                )
+                to_remove.append(order_id)
 
-            del self._pending_orders[order_id]
+            elif age >= timeout:
+                # 超时 + 仍在 open → 取消
+                try:
+                    self._order_client.cancel_order(order_id)
+                except Exception as e:
+                    logger.warning(f"取消订单异常: order_id={order_id}, {e}")
+
+                # 二次确认最终状态（防 cancel 和成交的 race condition）
+                filled = False
+                try:
+                    detail = self._order_client.get_order(order_id)
+                    filled = (isinstance(detail, dict) and
+                              detail.get("status") == "matched")
+                except Exception:
+                    pass  # 查询失败假设未成交，reverse 是安全方向
+
+                if filled:
+                    logger.info(
+                        f"挂单在取消窗口内成交: order_id={order_id} "
+                        f"K={signal.strike:.0f} {signal.direction} {signal.shares}份"
+                    )
+                else:
+                    self._position_manager.reverse_trade(signal)
+                    logger.info(
+                        f"挂单超时取消+仓位回退: order_id={order_id} "
+                        f"K={signal.strike:.0f} {signal.direction} "
+                        f"{signal.shares}份, 挂了{age:.0f}s"
+                    )
+
+                to_remove.append(order_id)
+            # else: 仍在 open + 未超时 → 继续等待
+
+        for oid in to_remove:
+            del self._pending_orders[oid]
 
     def _health_check(self, mins_left: float) -> dict:
         """健康检查"""
